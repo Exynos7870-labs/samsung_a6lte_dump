@@ -1,3 +1,4 @@
 0001-a6lte-select-the-shipped-Broadcom-firmware.patch
 0002-a6lte-document-FM-transport-and-add-stock-trace-decoder.patch
 0003-a6lte-integrate-experimental-Broadcom-HCI-FM.patch
+0004-a6lte-add-RDS-AF-and-FM-capture.patch

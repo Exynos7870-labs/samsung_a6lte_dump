@@ -4,8 +4,8 @@
 
 Inputs are pristine unpacked snapshots at the revisions in source-revisions.json.
 No checkout, reset, commit or push is performed in any input checkout. The first
-two device patches from the investigation are preserved; a third updates them
-with the implementation. All scratch history is on the session branch name.
+five integration patches are preserved; three follow-up patches add RDS/AF and
+FM-only recording. All scratch history is on the session branch name.
 """
 import argparse
 import os
@@ -26,13 +26,18 @@ DEVICE_PATCHES = [
     "0001-a6lte-select-the-shipped-Broadcom-firmware.patch",
     "0002-a6lte-document-FM-transport-and-add-stock-trace-decoder.patch",
     "0003-a6lte-integrate-experimental-Broadcom-HCI-FM.patch",
+    "0004-a6lte-add-RDS-AF-and-FM-capture.patch",
 ]
 
 
 def git(tree, *args):
-    return subprocess.check_output(
-        ["git", "-C", str(tree), "-c", "commit.gpgsign=false",
-         "-c", "core.hooksPath=/dev/null", *args], env=ENV, text=True).strip()
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(tree), "-c", "commit.gpgsign=false",
+             "-c", "core.hooksPath=/dev/null", *args], env=ENV, text=True).strip()
+    except subprocess.CalledProcessError as error:
+        print(error.output)
+        raise
 
 
 def initialize(base, dest):
@@ -70,8 +75,9 @@ def verify(base, expected, destination, patches):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_tree", type=Path, help="pristine A6 device snapshot")
-    parser.add_argument("--bt-tree", type=Path, required=True, help="pristine LineageOS system/bt snapshot")
-    parser.add_argument("--fm-tree", type=Path, required=True, help="pristine LineageOS FMRadio snapshot")
+    parser.add_argument("--bt-tree", type=Path, required=True)
+    parser.add_argument("--fm-tree", type=Path, required=True)
+    parser.add_argument("--java-home", type=Path, help="also run capture helper tests with this JDK")
     parser.add_argument("--sanitize", action="store_true")
     args = parser.parse_args()
     base = args.base_tree.resolve()
@@ -82,67 +88,62 @@ def main():
             HERE / "bluetooth-stack/btif/include/BcmFmProtocol.h").read_bytes():
         parser.error("protocol copies differ")
     patches = HERE / "patches"
-    device_patches = [patches / name for name in DEVICE_PATCHES]
-    bt_patch = patches / "system_bt/0001-bt-add-device-gated-Broadcom-FM-endpoint.patch"
-    fm_patch = patches / "FMRadio/0001-FMRadio-add-Broadcom-HCI-and-SEC-audio-support.patch"
+    projects = [
+        ("device", base, HERE / "device-tree", [patches / n for n in DEVICE_PATCHES],
+         "a6lte: add RDS/AF decoding and FM capture policy\n\n"
+         "Implement bounded FIFO polling, confirmed PS/2A/2B text and PI identity,\n"
+         "G0-to-UTF-8 conversion, Method-A/B AF lists and stronger-same-PI probes.\n"
+         "Restore tune/mute after probes and expose the real FMRadio JNI contract.\n"
+         "Attach the existing SEC FM capture port in an A6-specific audio policy.\n"
+         "Include decoder/failure-injection/AF/socket tests and hardware caveats.\n\n"
+         "Requires the v2 Bluetooth broker and FMRadio follow-up patches.\n"
+         "Firmware, Android policy/build and physical audio remain unverified."),
+        ("bt", args.bt_tree.resolve(), HERE / "bluetooth-stack", [
+            patches / "system_bt/0001-bt-add-device-gated-Broadcom-FM-endpoint.patch",
+            patches / "system_bt/0002-bt-allow-bounded-FM-RDS-FIFO-access.patch"],
+         "bt: allow bounded FM RDS FIFO access\n\n"
+         "Version the authenticated socket to v2. Permit FM+RDS power, FIFO flush,\n"
+         "a fixed waterline and only 240-byte FIFO read requests. Validate FIFO\n"
+         "replies as bounded whole triples while keeping scalar lengths exact.\n"
+         "Do not widen access to arbitrary VSCs, memory or pin configuration."),
+        ("app", args.fm_tree.resolve(), HERE / "fm-app", [
+            patches / "FMRadio/0001-FMRadio-add-Broadcom-HCI-and-SEC-audio-support.patch",
+            patches / "FMRadio/0002-FMRadio-wire-RDS-AF-and-FM-only-recording.patch"],
+         "FMRadio: wire RDS/AF and FM-only recording\n\n"
+         "Serialize BCM metadata polling with tuner operations; update station\n"
+         "database, UI and notifications using decoded UTF-8 PS/RadioText. Do not\n"
+         "probe AF while recording or override queued user station selections.\n"
+         "Enable recording through an explicit, verified FM-tuner AudioRecord,\n"
+         "feeding the existing AAC/file workflow without duplicating playback.\n"
+         "Reject microphone fallback, route changes and read failures; stop on\n"
+         "focus, Bluetooth, headset and service teardown. Add host capture tests.\n\n"
+         "HAL routing and encoded recordings require A6 hardware validation."),
+    ]
     with tempfile.TemporaryDirectory(prefix="a6lte-fm-") as tmp:
         tmp = Path(tmp)
-        device, bt, app = tmp / "device", tmp / "bt", tmp / "app"
-        initialize(base, device)
-        git(device, "am", "--whitespace=error", *map(str, device_patches[:2]))
-        overlay(HERE / "device-tree", device)
-        export_patch(device, device_patches[2],
-                     "a6lte: integrate experimental Broadcom HCI FM\n\n"
-                     "Package the separate JNI receiver backend and FMRadio, select the\n"
-                     "Bluetooth-owned endpoint and grant only system_app socket connect.\n"
-                     "Implement EU-band power/tune/readback/seek/scan/cancel/mute/volume\n"
-                     "with bounded failures and rollback, plus mock-controller tests.\n\n"
-                     "Use current vendor firmware without adding blobs or kernel drivers.\n"
-                     "Requires companion patches in system/bt and packages/apps/FMRadio.\n"
-                     "Hardware-unverified: protocol/audio assumptions are documented;\n"
-                     "RDS/AF, recording and FM-to-Bluetooth audio remain disabled.", 3)
-        initialize(args.bt_tree.resolve(), bt)
-        overlay(HERE / "bluetooth-stack", bt)
-        export_patch(bt, bt_patch,
-                     "bt: add device-gated Broadcom FM endpoint\n\n"
-                     "Use Fluoride's existing HCI queue/credits rather than sharing the\n"
-                     "UART out of band. Authenticate UID 1000 and allow only the needed\n"
-                     "FM registers, never arbitrary VSCs or pin configuration.\n\n"
-                     "Bound transactions, handle late callbacks without request-owned\n"
-                     "pointers, and stop the session before HCI teardown. Attempt FM OFF\n"
-                     "and SEC audio route cleanup on client death. Other devices leave\n"
-                     "BRCM_FM_HCI_INCLUDED undefined and do not create the endpoint.\n\n"
-                     "Experimental A6 receive integration; not hardware validated.\n"
-                     "Base: bcca9a572f1cc539ba21ebe940c3642ce8707d1a")
-        initialize(args.fm_tree.resolve(), app)
-        overlay(HERE / "fm-app", app)
-        export_patch(app, fm_patch,
-                     "FMRadio: add Broadcom HCI and SEC audio support\n\n"
-                     "Select a separate JNI soname and opt-in device resource. Require\n"
-                     "Bluetooth enabled and a wired antenna; follow adapter/SCO/focus\n"
-                     "lifecycle, bound cancellation and monitor link health. Route through\n"
-                     "the Samsung SEC HAL rather than software-looping direct FM audio.\n\n"
-                     "Use per-track output selection and receiver digital volume. Keep\n"
-                     "RDS/AF unsupported and recording UI disabled for this candidate.\n"
-                     "Legacy devices keep the existing libfmjni and audio path.\n\n"
-                     "Experimental: exact firmware response and audio route need phone\n"
-                     "validation; a stock log is not required to build this candidate.\n"
-                     "Base: c8664126026de37a442dba996db8bc4d3606dc41")
-        (patches / "series").write_text("".join(name + "\n" for name in DEVICE_PATCHES))
-        for path in (bt_patch, fm_patch):
-            (path.parent / "series").write_text(path.name + "\n")
-        applied_device, applied_bt, applied_app = tmp / "verify-device", tmp / "verify-bt", tmp / "verify-app"
-        verify(base, device, applied_device, device_patches)
-        verify(args.bt_tree.resolve(), bt, applied_bt, [bt_patch])
-        verify(args.fm_tree.resolve(), app, applied_app, [fm_patch])
+        applied = {}
+        for name, source, files, series, message in projects:
+            tree = tmp / name
+            preserved = [p.read_bytes() for p in series[:-1]]
+            initialize(source, tree)
+            git(tree, "am", "--whitespace=error", *map(str, series[:-1]))
+            overlay(files, tree)
+            export_patch(tree, series[-1], message, len(series))
+            assert preserved == [p.read_bytes() for p in series[:-1]]
+            (series[-1].parent / "series").write_text("".join(p.name + "\n" for p in series))
+            applied[name] = tmp / ("verify-" + name)
+            verify(source, tree, applied[name], series)
         subprocess.run(["python3", "-m", "unittest", "discover", "-s", "tools/fm/tests", "-v"],
-                       cwd=applied_device, check=True)
-        command = ["python3", str(applied_device / "fm/tests/run_host_tests.py"),
-                   "--bt-tree", str(applied_bt)]
+                       cwd=applied["device"], check=True)
+        command = ["python3", str(applied["device"] / "fm/tests/run_host_tests.py"),
+                   "--bt-tree", str(applied["bt"])]
         if args.sanitize:
             command.append("--sanitize")
         subprocess.run(command, check=True)
-        print("PASS: all five patches git-am applied; all three resulting trees match; host tests passed.")
+        if args.java_home:
+            subprocess.run(["python3", str(applied["app"] / "tests/run_capture_tests.py"),
+                            "--java-home", str(args.java_home.resolve())], check=True)
+        print("PASS: all eight patches git-am applied; three trees match; selected host tests passed.")
 
 
 if __name__ == "__main__":

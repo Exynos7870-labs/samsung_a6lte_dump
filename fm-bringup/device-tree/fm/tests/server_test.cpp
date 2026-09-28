@@ -38,9 +38,10 @@ void transmit(BT_HDR* command, Complete complete, Status status, void* token) {
     callbacks.emplace_back([=] {
         std::this_thread::sleep_for(std::chrono::milliseconds(mode == 1 ? 1750 : 10));
         if (mode == 2) { status(0x0c, command, token); return; }
-        auto* event = static_cast<BT_HDR*>(osi_calloc(sizeof(BT_HDR) + 8));
-        event->len = 8;
-        const uint8_t bytes[] = {0x0e, 6, 1, 0x15, 0xfc, 0, command->data[3], command->data[4]};
+        const int size = mode == 3 && command->data[3] == 0x80 ? 248 : 8;
+        auto* event = static_cast<BT_HDR*>(osi_calloc(sizeof(BT_HDR) + size));
+        event->len = size;
+        const uint8_t bytes[] = {0x0e, uint8_t(size - 2), 1, 0x15, 0xfc, 0, command->data[3], command->data[4]};
         memcpy(event->data, bytes, sizeof(bytes));
         complete(event, token);  // callback owns event
         osi_free(command);       // HCI owns command on Command Complete
@@ -133,4 +134,19 @@ int main() {
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
     close(client); drain(); btif_bcm_fm_stop();
     std::cout << "PASS adapter shutdown unblocks an outstanding request\n";
+    behavior = 3; btif_bcm_fm_start(); client = connectClient();
+    const std::vector<uint8_t> fifo{0x15,0xfc,3,0x80,1,240};
+    assert(send(client, fifo.data(), fifo.size(), MSG_NOSIGNAL)==6);
+    uint8_t packet[257];
+    const auto length = recv(client, packet, sizeof(packet), MSG_TRUNC);
+    assert(length==248);
+    std::vector<uint8_t> data;
+    assert(bcmfm::response(fifo, {packet, packet+length}, &data) && data.size()==240);
+    count = transmissions;
+    assert(request(client, {0x15,0xfc,3,0x80,1,239})<=0); // no arbitrary FIFO/memory length
+    close(client); waitFor([&] { return transmissions==count+1; }); drain();
+    assert(transmissions==count+1); // only cleanup OFF
+    btif_bcm_fm_stop(); drain();
+    std::cout << "PASS bounded RDS FIFO socket payload and invalid length rejection\n";
+
 }

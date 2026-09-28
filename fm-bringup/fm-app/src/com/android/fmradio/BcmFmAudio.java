@@ -67,7 +67,7 @@ final class BcmFmAudio {
             mTrack.play();
             mManager.setParameters("l_fmradio_mode=on");
             return true;
-        } catch (IllegalArgumentException | IllegalStateException error) {
+        } catch (RuntimeException error) {
             Log.e(TAG, "FM audio start failed", error);
             stop();
             return false;

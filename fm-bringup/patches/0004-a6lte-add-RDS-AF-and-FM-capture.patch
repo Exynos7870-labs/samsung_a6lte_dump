@@ -1,0 +1,1337 @@
+From 85f5f87916535e5d9e786a0a614335418cb8ac44 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH] a6lte: add RDS/AF decoding and FM capture policy
+
+Implement bounded FIFO polling, confirmed PS/2A/2B text and PI identity,
+G0-to-UTF-8 conversion, Method-A/B AF lists and stronger-same-PI probes.
+Restore tune/mute after probes and expose the real FMRadio JNI contract.
+Attach the existing SEC FM capture port in an A6-specific audio policy.
+Include decoder/failure-injection/AF/socket tests and hardware caveats.
+
+Requires the v2 Bluetooth broker and FMRadio follow-up patches.
+Firmware, Android policy/build and physical audio remain unverified.
+---
+ configs/audio/audio_policy_configuration.xml | 152 +++++++++++++++++
+ device.mk                                    |   6 +
+ docs/fm-integration.md                       |  23 ++-
+ docs/fm-radio.md                             |   5 +-
+ docs/fm-rds-recording.md                     | 164 ++++++++++++++++++
+ fm/Android.mk                                |   2 +-
+ fm/BcmFmProtocol.h                           |  17 +-
+ fm/BcmFmRadio.cpp                            |  92 +++++++++++
+ fm/BcmFmRadio.h                              |  15 ++
+ fm/FmJni.cpp                                 |  27 ++-
+ fm/README.md                                 |   7 +-
+ fm/RdsCharset.h                              |  39 +++++
+ fm/RdsDecoder.cpp                            | 140 ++++++++++++++++
+ fm/RdsDecoder.h                              |  46 ++++++
+ fm/tests/radio_test.cpp                      |  81 ++++++++-
+ fm/tests/rds_test.cpp                        | 165 +++++++++++++++++++
+ fm/tests/run_host_tests.py                   |   6 +-
+ fm/tests/server_test.cpp                     |  22 ++-
+ 18 files changed, 980 insertions(+), 29 deletions(-)
+ create mode 100644 configs/audio/audio_policy_configuration.xml
+ create mode 100644 docs/fm-rds-recording.md
+ create mode 100644 fm/RdsCharset.h
+ create mode 100644 fm/RdsDecoder.cpp
+ create mode 100644 fm/RdsDecoder.h
+ create mode 100644 fm/tests/rds_test.cpp
+
+diff --git a/configs/audio/audio_policy_configuration.xml b/configs/audio/audio_policy_configuration.xml
+new file mode 100644
+index 0000000..64a9e87
+--- /dev/null
++++ b/configs/audio/audio_policy_configuration.xml
+@@ -0,0 +1,152 @@
++<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<!-- add for Samsung LSI model -->
++
++<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
++
++    <globalConfiguration speaker_drc_enabled="false"/>
++
++    <modules>
++        <module name="primary" halVersion="3.0">
++            <attachedDevices>
++                <item>Earpiece</item>
++                <item>Speaker</item>
++                <item>Built-In Mic</item>
++                <item>Built-In Back Mic</item>
++                <item>Voice Call Mic</item>
++                <item>FM Mic</item>
++            </attachedDevices>
++
++            <defaultOutputDevice>Speaker</defaultOutputDevice>
++
++            <mixPorts>
++                <!-- Playback(Output) Streams -->
++                <mixPort name="primary-out" role="source" flags="AUDIO_OUTPUT_FLAG_PRIMARY|AUDIO_OUTPUT_FLAG_DEEP_BUFFER">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++
++                <mixPort name="fast" role="source" flags="AUDIO_OUTPUT_FLAG_FAST">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++
++                <mixPort name="hdmi" role="source" flags="AUDIO_OUTPUT_FLAG_MULTI_CH">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO,AUDIO_CHANNEL_OUT_5POINT1"/>
++                </mixPort>
++
++                <!-- Capture(Input) Streams -->
++                <mixPort name="primary-in" role="sink">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </mixPort>
++
++            </mixPorts>
++
++            <devicePorts>
++                <!-- output devices declaration, i.e. Sink DEVICE PORT -->
++                <devicePort tagName="Earpiece" role="sink" type="AUDIO_DEVICE_OUT_EARPIECE">
++                   <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
++                </devicePort>
++                <devicePort tagName="Speaker" role="sink" type="AUDIO_DEVICE_OUT_SPEAKER">
++                   <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </devicePort>
++                <devicePort tagName="Wired Headset" role="sink" type="AUDIO_DEVICE_OUT_WIRED_HEADSET">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </devicePort>
++                <devicePort tagName="Wired Headphone" role="sink" type="AUDIO_DEVICE_OUT_WIRED_HEADPHONE">
++                   <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </devicePort>
++                <devicePort tagName="Bt Sco All" role="sink" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET">
++                   <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                            samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </devicePort>
++                <devicePort tagName="Aux Device Out" role="sink" type="AUDIO_DEVICE_OUT_AUX_DIGITAL">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="44100,48000,64000,88200,96000,128000,176400,192000"
++                             channelMasks="AUDIO_CHANNEL_OUT_MONO,AUDIO_CHANNEL_OUT_STEREO,AUDIO_CHANNEL_OUT_2POINT1,AUDIO_CHANNEL_OUT_QUAD,AUDIO_CHANNEL_OUT_PENTA,AUDIO_CHANNEL_OUT_5POINT1,AUDIO_CHANNEL_OUT_6POINT1,AUDIO_CHANNEL_OUT_7POINT1"/>
++                </devicePort>
++
++                <!-- input devices declaration, i.e. source DEVICE PORT -->
++                <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++                <devicePort tagName="Built-In Back Mic" type="AUDIO_DEVICE_IN_BACK_MIC" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++                <devicePort tagName="Wired Headset Mic" type="AUDIO_DEVICE_IN_WIRED_HEADSET" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++                <devicePort tagName="Bt Sco Headset Mic" type="AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++                <devicePort tagName="Aux Device In" type="AUDIO_DEVICE_IN_AUX_DIGITAL" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++                <devicePort tagName="Voice Call Mic" type="AUDIO_DEVICE_IN_VOICE_CALL" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++                <devicePort tagName="FM Mic" type="AUDIO_DEVICE_IN_FM_TUNER" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK,AUDIO_CHANNEL_IN_VOICE_UPLINK,AUDIO_CHANNEL_IN_VOICE_DNLINK"/>
++                </devicePort>
++
++            </devicePorts>
++
++            <routes>
++                <route sink="Earpiece" type="mix"
++                       sources="primary-out,fast"/>
++                <route sink="Speaker" type="mix"
++                       sources="primary-out,fast"/>
++                <route sink="Wired Headset" type="mix"
++                       sources="primary-out,fast"/>
++                <route sink="Wired Headphone" type="mix"
++                       sources="primary-out,fast"/>
++                <route sink="Bt Sco All" type="mix"
++                       sources="primary-out,fast"/>
++                <route sink="Aux Device Out" type="mix"
++                       sources="hdmi"/>
++
++                <route sink="primary-in" type="mix"
++                       sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,Bt Sco Headset Mic,Aux Device In,Voice Call Mic,FM Mic"/>
++
++            </routes>
++        </module>
++
++        <!-- A2DP Input Audio HAL -->
++        <xi:include href="a2dp_in_audio_policy_configuration.xml"/>
++
++        <!-- Bluetooth Audio HAL -->
++        <xi:include href="bluetooth_audio_policy_configuration.xml"/>
++
++        <!-- Usb Audio HAL -->
++        <xi:include href="usb_audio_policy_configuration.xml"/>
++
++        <!-- Remote Submix Audio HAL -->
++        <xi:include href="r_submix_audio_policy_configuration.xml"/>
++
++    </modules>
++
++    <!-- Volume section -->
++    <xi:include href="audio_policy_volumes.xml"/>
++    <xi:include href="default_volume_tables.xml"/>
++
++</audioPolicyConfiguration>
+diff --git a/device.mk b/device.mk
+index ccb4c02..553439e 100644
+--- a/device.mk
++++ b/device.mk
+@@ -139,6 +139,12 @@ PRODUCT_COPY_FILES += \
+ # Properties
+ -include $(DEVICE_PATH)/vendor_prop.mk
+ 
++# A6-specific copy must precede common inheritance: the first destination wins.
++# Same pinned SEC policy as common, with its existing FM input attached so an
++# explicit RADIO_TUNER AudioRecord can select it. Other routes stay unchanged.
++PRODUCT_COPY_FILES += \
++    $(DEVICE_PATH)/configs/audio/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml
++
+ # Inherit from common
+ $(call inherit-product, device/samsung/universal7870-common/device-common.mk)
+ 
+diff --git a/docs/fm-integration.md b/docs/fm-integration.md
+index ebb71b6..044c2f4 100644
+--- a/docs/fm-integration.md
++++ b/docs/fm-integration.md
+@@ -4,7 +4,8 @@ This is a **source-based integration candidate**, not a hardware-validated FM
+ release. It uses the current A6 vendor repository at
+ `f0c55d795a9be60147d76a42ec93fd9ba3e5800f` (`lineage-18.1`), the supplied stock dump,
+ and the Broadcom FM register protocol. A stock log is useful but is **not required
+-to build or try this candidate**. No vendor blobs or kernel files are changed.
++to build or try this candidate**. No vendor blobs or kernel files are changed. An A6 audio-policy copy attaches
++the existing FM capture input without changing other routes.
+ The current vendor's `bcm4345C5_V0069.0172.hcd` is byte-identical to the dump
+ (SHA-256 `fe5d61771d2e26310f295ee7241b5d188b80d80d3b6805f4a6452d52783a2225`).
+ 
+@@ -12,6 +13,13 @@ Apply the companion patches to **both** `system/bt` and `packages/apps/FMRadio`,
+ then apply the device patches. Adding only `FMRadio` to PRODUCT_PACKAGES, or
+ applying only this device patch, is not sufficient.
+ 
++## RDS and recording extension
++
++Device patch 0004 and companion patches 0002 implement RDS PS/RadioText/AF and
++FM-only recording. Read [fm-rds-recording.md](fm-rds-recording.md) for protocol,
++recording source checks, AF policy, reference sources and added tests. Earlier
++patch descriptions refer to the initial candidate, not the complete series.
++
+ ## Source baselines
+ 
+ | Project | Revision | Inspected base |
+@@ -80,8 +88,9 @@ FMRadio -> AudioManager l_fmradio_mode -> Samsung SEC audio HAL
+   Link health is checked while playing. Bluetooth shutdown, headset removal,
+   focus loss and SCO audio activation stop the FM route; long scans are cancelled
+   rather than leaving power-off queued behind a scan.
+-* **RDS/AF and recording are disabled.** The backend reports RDS unsupported and
+-  the recording actions are hidden/rejected. No fake station metadata is returned.
++* RDS PS (0A/0B), RadioText (2A/2B), PI-confirmed AF and FM-input-only recording
++  are implemented. Metadata comes from FIFO blocks, never fabricated values.
++  Recording refuses microphone fallback; neither FIFO nor capture is hardware-verified.
+ * **No FM-to-A2DP/SCO playback**, no secondary-user support, and no automatic
+   Bluetooth power management. Normal Bluetooth/Wi-Fi coexistence is a test item,
+   not yet a verified claim.
+@@ -166,10 +175,12 @@ python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt"
+ python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt" --sanitize
+ ```
+ 
+-The native suite has 24 mock-controller test groups, including failure injection
+-at every power-on I/O step. Six broker/socket test scenarios exercise exclusivity,
++The native suite has 32 mock-controller test groups, including failure injection
++at every power-on I/O step. Seven broker/socket test scenarios exercise exclusivity,
+ peer rejection, bad requests, client death, timeouts, late callbacks, adapter
+-restart/shutdown and callback ownership. The broker tests compile the real broker
++restart/shutdown, callback ownership and a maximum-size FIFO reply. There are
++also 16 RDS decoder groups, 8 Java capture-helper and 6 encoder lifecycle tests
++with mock Android audio/codec boundaries. The broker tests compile the real broker
+ against **host mocks** for HCI/audio/peer credentials; they are not Android HAL or
+ SELinux tests. ASan/UBSan passed in the development workspace.
+ 
+diff --git a/docs/fm-radio.md b/docs/fm-radio.md
+index de79b6b..d60229f 100644
+--- a/docs/fm-radio.md
++++ b/docs/fm-radio.md
+@@ -138,8 +138,9 @@ the companion patch series. No kernel radio driver or stock APK transplant is
+ used. See [fm-integration.md](fm-integration.md) for implementation details.
+ 
+ Remaining work is an Android/SELinux build, phone validation of the inferred
+-protocol and audio sequence, and implementation/validation of the deliberately
+-disabled RDS/AF and recording features. Regional modes beyond the EU band,
++protocol, RDS FIFO and playback/capture sequence. RDS PS/RadioText, PI-checked AF
++and FM-only recording are now implemented in the follow-up series; see
++[fm-rds-recording.md](fm-rds-recording.md). Regional modes beyond the EU band,
+ secondary users, and FM-to-Bluetooth audio are not supported in this candidate.
+ Normal Bluetooth/Wi-Fi coexistence also needs hardware testing. A stock trace
+ can refine the implementation later; new-ROM failure logs can be used first.
+diff --git a/docs/fm-rds-recording.md b/docs/fm-rds-recording.md
+new file mode 100644
+index 0000000..556691a
+--- /dev/null
++++ b/docs/fm-rds-recording.md
+@@ -0,0 +1,164 @@
++# RDS, AF and FM recording follow-up
++
++This extends the initial receiver candidate to implement the metadata and recording
++paths used by LineageOS FMRadio `lineage-18.1`. It is **source implementation, not a
++claim of working A6 hardware**. Android/SELinux builds, the exact firmware FIFO,
++physical audio routing and encoded recordings still require device validation.
++No stock log is required before building this candidate.
++
++## RDS transport and decoding
++
++The authenticated socket is now `a6lte.bcm_fm.v2`. Upgrade both the Bluetooth and
++JNI sides together. The previous v1 endpoint cannot accept RDS operations.
++
++The additional allowlisted FC15 operations are:
++
++* SYS `00 = 03`: FM plus RDS (00/01 remain off/FM-only).
++* RDS control `02 = 02`: RDS mode, flush FIFO.
++* Waterline `14 = 64`: tuples, not bytes.
++* FIFO `80`, read length **240 only**. Replies must retain the matching register,
++  access echo, successful status and exact HCI event length. Only this register
++  accepts shorter payloads: 0..240 bytes, divisible by three. Other registers
++  retain strict scalar-width checks. There is no arbitrary memory/pin access.
++
++The reference describes triples `[status, MSB, LSB]`, block types A/B/C/D/C-prime,
++quality bits 3:2 and the empty/end tuple `7c ff ff`. The implementation polls the
++FIFO every 250 ms while playing, rather than adding an asynchronous HCI event
++owner. Masks remain zero. **Polling without an interrupt and exact FIFO reply
++framing have not been observed on an A6**. Malformed replies fail closed.
++
++The independent decoder handles:
++
++* Ordered groups, C-prime PI validation, corrected versus uncorrectable blocks,
++  partial groups across reads, empty markers and bounded malformed data.
++* PI confirmation from two groups before accepting station metadata.
++* PS from groups 0A/0B, with repeated segments and protection against mixed names.
++* RadioText 2A (64 characters) and 2B (32), repeated segments, terminators,
++  A/B and version changes, and incomplete-message suppression.
++* RDS G0 character conversion to UTF-8, including accented European characters.
++  Control characters are not forwarded into UI/database fields.
++* Station changes and 15-second data loss invalidate metadata. Tune, search,
++  disable and power-down reset caches; tuner changes flush the hardware FIFO.
++* Complete repeated Method-A AF lists and repeated Method-B pairs containing
++  the tuned transmitter. Filler, LF/MF escapes and other-network EON lists are
++  not mistaken for FM alternatives.
++
++The real `setRds`, `readRds`, `getPs`, `getLrText`, `isRdsSupport` and `activeAf`
++JNI functions replace the previous stubs. Event bits match the app: PS 0008,
++RT 0040 and AF 0080. Java explicitly decodes UTF-8. The BCM service polls on its
++existing tuner handler, not the legacy RDS thread, so metadata cannot race a
++handler-owned tune/seek/scan. It updates listeners, the station database and
++notifications. RDS resumes after failed/restored tunes and seeks too.
++
++This implements the app's PS/RadioText/AF contract, not every optional RDS
++application: CT display, EON traffic switching, RT+, ODA and extended UCS-2 text
++are not added to the app.
++
++## Alternative-frequency policy
++
++A complete AF list alone never requests a blind retune. The receiver first needs
++weak signal (RSSI magnitude at least 105, using the reference's conversion).
++Probes mute the receiver, try at most two candidates per attempt, and require
++at least a 6 dB improvement plus a twice-confirmed **identical PI**. Each PI wait
++is limited to 1.2 seconds; probing has a five-second budget checked between I/O,
++in addition to per-transaction timeouts. Restoration can take additional time.
++
++Every probe restores the original frequency and mute state before returning a
++recommendation. A cancelled probe stays muted. There is a 30-second retry
++cooldown. Java applies the recommended tune through the existing UI workflow
++only if no stop, focus loss, user tune/seek/scan, power-up or recording request
++has superseded it. AF probing is suppressed during recording. Thresholds and
++mute/retune behavior need field validation; there is no seamless-handover claim.
++
++## Recording
++
++The Record/Recordings menu actions are enabled again. `BcmFmCapture` opens
++`AudioSource.RADIO_TUNER` at 48 kHz, stereo PCM16, explicitly selects an
++`AudioDeviceInfo.TYPE_FM_TUNER` input and verifies the actual routed device's
++**type and ID**, not just `setPreferredDevice()` success.
++
++* Discard startup data until the route is established; time out after one second.
++* Reject microphone/call/mix fallback, unavailable input, wrong device, read
++  errors, non-frame-aligned data, route changes and a two-second input stall.
++* Recheck the actual route before and after every read. Feed only verified FM
++  PCM to the existing FMRadio AAC/M4A encoder and save/discard/media-database
++  workflow. Do not render these samples on top of direct hardware playback.
++* Stop capture immediately on Bluetooth/headset/focus/service shutdown;
++  finalize recording through the existing recorder workflow. Stop even on duck
++  focus loss rather than silently recording an unintended source.
++* Use a nonblocking read loop and a single release owner. Synchronize stop with
++  sample delivery so an old capture cannot feed a later recording session.
++
++The A6 policy copy comes from pinned common-device revision
++`a433c37b08659956b366e06019c36e310a0b2781`,
++`configs/audio/audio_policy_configuration.xml`. Its existing FM Mic port and
++primary-in route are unchanged; **only FM Mic is added to attachedDevices**.
++The A6 product copy precedes common inheritance so it wins the duplicate copy
++file destination. Verify the installed policy after building. No common/vendor
++repository patch or direct app access to ALSA devices is required by this design.
++The app explicitly requests signature-protected CAPTURE_AUDIO_OUTPUT for the
++RADIO_TUNER source, in addition to its existing recording permission.
++
++The AAC helper also fixes the upstream asynchronous muxer startup: it waits for
++`onOutputFormatChanged` and codec-specific data, skips codec-config packets,
++tracks all available input buffers, drains one EOS, bounds queued PCM to 1 MiB,
++limits EOS waiting to three seconds and releases resources/error waiters on
++failure. Early errors are retained until a listener is registered. These fixes
++also benefit the legacy capture path because it shares the encoder.
++
++The policy declaring an FM input does not prove the SEC HAL actually captures
++FM samples. Actual-route checks protect against a framework-level fallback;
++they cannot prove the physical HAL source. Check real recorded audio and input
++routing before calling recording functional. HAL gain/mute interaction with
++recording is also unverified.
++
++## Sources and licensing
++
++Protocol facts were inspected in Broadcom's reference driver, not imported as a
++kernel transport:
++
++* [fmdrv.h](https://github.com/arttttt/SmokeR24.1-kernel/blob/9582e3a65caff954e40c8795bd2a909b2e4d92b8/drivers/bluetooth/broadcom/v4l2_fm_driver/fmdrv.h)
++* [fmdrv_main.c](https://github.com/arttttt/SmokeR24.1-kernel/blob/9582e3a65caff954e40c8795bd2a909b2e4d92b8/drivers/bluetooth/broadcom/v4l2_fm_driver/fmdrv_main.c)
++* [fmdrv_rx.c](https://github.com/arttttt/SmokeR24.1-kernel/blob/9582e3a65caff954e40c8795bd2a909b2e4d92b8/drivers/bluetooth/broadcom/v4l2_fm_driver/fmdrv_rx.c)
++
++`RdsCharset.h` adapts only the EN 50067 G0 table from
++[redsea rdsstring.cc](https://github.com/windytan/redsea/blob/7555c9f6259d50718697ee8c9f218ea012c6892c/src/text/rdsstring.cc).
++Its permissive copyright/license notice is retained in that file. The decoder
++and receiver integration are independently implemented under Apache-2.0.
++
++## Tests and hardware checklist
++
++Host suites: 32 receiver/control groups (including RDS initialization failures,
++FIFO errors, AF identity/hysteresis/restoration/cancellation), 16 decoder groups
++(including 20,000 deterministic malformed inputs), 7 actual-broker/socket
++scenarios, 8 Java capture scenarios and 6 encoder lifecycle scenarios against
++mock Android audio/codec/muxer boundaries.
++The 22 offline HCI decoder tests remain. Native/RDS/broker tests pass ASan/UBSan;
++Java sources type-check with Android 11 classes and synthetic test R constants.
++These are not Android resource, policy, codec or hardware tests.
++
++From the respective patched projects:
++
++```sh
++# device/samsung/a6lte
++python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt" --sanitize
++# packages/apps/FMRadio
++python3 tests/run_capture_tests.py --java-home /path/to/a/host/jdk
++```
++
++On the phone, additionally verify:
++
++1. PS and 2A/2B RadioText on known broadcasts; accents, changing text, weak signal,
++   retunes, no RDS on a station, repeated on/off and Bluetooth toggles.
++2. No stale metadata saved against a new station. No wakeups after service exit.
++3. AF must retain the same programme; cancellation/calls must restore/stop audio.
++   Verify no probes or programme changes occur during recording.
++4. The installed policy exposes FM Mic. Verify actual FM input routing using
++   `dumpsys media.audio_flinger` and `dumpsys media.audio_policy`.
++5. Play back saved M4A files; check content, channel count, duration, save/discard,
++   storage-full/unmount, routing changes, calls, headset removal and app death.
++   An error or silence must not be reported as proof of working FM capture.
++
++Useful log tags now also include `BcmFmCapture`, `FmService`, `FmRecorder` and
++`AudioRecorder`, alongside `BcmFm`, `bt_bcm_fm`, `BcmFmAudio` and AndroidRuntime.
++Review/redact logs before sharing.
+diff --git a/fm/Android.mk b/fm/Android.mk
+index 7d6d1f4..229fad6 100644
+--- a/fm/Android.mk
++++ b/fm/Android.mk
+@@ -5,7 +5,7 @@ LOCAL_PATH := $(call my-dir)
+ ifeq ($(BOARD_HAVE_BCM_FM_HCI),true)
+ include $(CLEAR_VARS)
+ LOCAL_MODULE := libfmjni_bcm_hci
+-LOCAL_SRC_FILES := BcmFmRadio.cpp FmJni.cpp
++LOCAL_SRC_FILES := BcmFmRadio.cpp RdsDecoder.cpp FmJni.cpp
+ LOCAL_HEADER_LIBRARIES := jni_headers
+ LOCAL_SHARED_LIBRARIES := liblog
+ LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Werror
+diff --git a/fm/BcmFmProtocol.h b/fm/BcmFmProtocol.h
+index f5c8e3b..95ab791 100644
+--- a/fm/BcmFmProtocol.h
++++ b/fm/BcmFmProtocol.h
+@@ -8,7 +8,7 @@
+ 
+ namespace bcmfm {
+ // Abstract AF_UNIX/SOCK_SEQPACKET socket. HCI command/event bytes, no H4 prefix.
+-constexpr char kSocket[] = "a6lte.bcm_fm.v1";
++constexpr char kSocket[] = "a6lte.bcm_fm.v2";
+ constexpr uint32_t kClientUid = 1000;     // platform FMRadio's android.uid.system
+ constexpr uint32_t kServerUid = 1002;     // Bluetooth app, NOT the vendor HAL
+ constexpr size_t kMaxEvent = 257;
+@@ -20,8 +20,8 @@ inline bool validFrequency(int khz) {
+ }
+ inline uint16_t le16(const uint8_t* p) { return p[0] | (uint16_t(p[1]) << 8); }
+ 
+-// Defence in depth: no generic HCI access, pin mux, RAM, firmware or RDS FIFO
+-// operations. Match every request length and value before it enters Fluoride.
++// Defence in depth: no generic HCI access, pin mux, RAM, firmware operations. RDS FIFO reads are fixed at 240 bytes maximum.
++// Match every request length and value before it enters Fluoride.
+ inline bool allowed(const uint8_t* p, size_t n) {
+     if (n < 6 || n > 7 || p[0] != 0x15 || p[1] != 0xfc || p[2] != n - 3)
+         return false;
+@@ -31,6 +31,7 @@ inline bool allowed(const uint8_t* p, size_t n) {
+         switch (reg) {
+             case 0x00: case 0x01: case 0x0f: case 0x4d: case 0xdf:
+                 return p[5] == 1;
++            case 0x80: return p[5] == 240; // bounded RDS FIFO, no arbitrary memory reads
+             case 0x05: case 0x0a: case 0x12:
+                 return p[5] == 2;
+             default: return false;
+@@ -39,7 +40,9 @@ inline bool allowed(const uint8_t* p, size_t n) {
+     if (access != 0) return false;
+     if (n == 6) {
+         switch (reg) {
+-            case 0x00: return p[5] <= 1;       // FM off/on, no RDS yet
++            case 0x00: return p[5] == 0 || p[5] == 1 || p[5] == 3; // FM / FM+RDS
++            case 0x02: return p[5] == 2; // RDS mode and FIFO flush
++            case 0x14: return p[5] == 64; // FIFO waterline in tuples
+             case 0x01: return p[5] == 0x02;    // west band, auto stereo
+             case 0x07: return p[5] == 105 || p[5] == (105 | 0x80);
+             case 0x08: return p[5] == 10;      // stock SNR threshold
+@@ -67,7 +70,11 @@ inline bool response(const std::vector<uint8_t>& request,
+         event[3] != 0x15 || event[4] != 0xfc || event[5] != 0 ||
+         event[6] != request[3] || event[7] != request[4]) return false;
+     const size_t expected = request[4] == 1 ? request[5] : 0;
+-    if (event.size() != 8 + expected) return false;
++    if (request[3] == 0x80 && request[4] == 1) {
++        // Firmware may return an end marker / short FIFO. All other registers
++        // retain exact-width validation. Echo, status and HCI length stay strict.
++        if (event.size() > 8 + expected || (event.size() - 8) % 3) return false;
++    } else if (event.size() != 8 + expected) return false;
+     data->assign(event.begin() + 8, event.end());
+     return true;
+ }
+diff --git a/fm/BcmFmRadio.cpp b/fm/BcmFmRadio.cpp
+index ea0b250..3ae075b 100644
+--- a/fm/BcmFmRadio.cpp
++++ b/fm/BcmFmRadio.cpp
+@@ -93,6 +93,8 @@ bool Radio::down() {
+         ok = write(0x00, 0);
+         bus_.close();
+     }
++    rdsEnabled_ = false;
++    rds_.reset();
+     powered_ = connected_ = false;
+     muted_ = true;
+     return ok;
+@@ -106,6 +108,7 @@ bool Radio::powerDown() {
+ Radio::Search Radio::search(int khz, bool seeking, bool up, uint64_t generation, int* found) {
+     if (!powered_ || !validFrequency(khz)) return Search::Error;
+     if (generation != cancel_.load()) return Search::Cancelled;
++    if (!resetRds()) return Search::Error;
+     int stale;
+     if (!write(0x09, 0) || !read(0x12, 2, &stale) ||
+         (seeking && !write(0x07, 105 | (up ? 0x80 : 0))) ||
+@@ -131,6 +134,7 @@ Radio::Search Radio::search(int khz, bool seeking, bool up, uint64_t generation,
+                 return Search::Error;
+             }
+             frequency_ = *found;
++            if (!resetRds()) return Search::Error;
+             return Search::Found;
+         }
+         clock_.sleepMs(40);
+@@ -223,4 +227,92 @@ bool Radio::alive() {
+     if (connected_) down();
+     return false;
+ }
++bool Radio::resetRds() {
++    rds_.reset();
++    return !rdsEnabled_ || write(0x02, 2);
++}
++bool Radio::fifo(RdsDecoder& decoder) {
++    Bytes request{0x15, 0xfc, 3, 0x80, 1, 240}, event, data;
++    return bus_.exchange(request, &event) && response(request, event, &data) &&
++           decoder.feed(data, frequency_, clock_.nowMs());
++}
++bool Radio::setRds(bool enabled) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    rds_.reset();
++    rdsEnabled_ = false;
++    if (!powered_) return !enabled;
++    if (!write(0x00, enabled ? 3 : 1) ||
++        (enabled && (!write(0x02, 2) || !write(0x14, 64)))) {
++        logError("RDS initialization failed");
++        down(); return false;
++    }
++    rdsEnabled_ = enabled;
++    nextAfCheck_ = 0;
++    return true;
++}
++int Radio::rssiMagnitude() {
++    int raw;
++    return read(0x0f, 1, &raw) ? ((0x80 - raw) & 0x7f) : -1;
++}
++int Radio::pollRds() {
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    if (!lock.owns_lock() || !powered_ || !rdsEnabled_) return 0;
++    if (!fifo(rds_)) { logError("RDS FIFO read failed"); down(); return 0; }
++    rds_.expire(clock_.nowMs());
++    int events = rds_.takeEvents();
++    if (clock_.nowMs() >= nextAfCheck_ && clock_.nowMs() >= nextAfAttempt_ &&
++        rds_.pi() && rds_.alternatives().size() > 1) {
++        nextAfCheck_ = clock_.nowMs() + 2000;
++        if (rssiMagnitude() >= 105) events |= RdsDecoder::kAf;
++    }
++    return events;
++}
++std::string Radio::programService() {
++    std::lock_guard<std::mutex> lock(mutex_); return rds_.ps();
++}
++std::string Radio::radioText() {
++    std::lock_guard<std::mutex> lock(mutex_); return rds_.text();
++}
++int Radio::activeAf() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!powered_ || !rdsEnabled_ || !rds_.pi() || clock_.nowMs() < nextAfAttempt_) return -1;
++    nextAfAttempt_ = clock_.nowMs() + 30000; // no repeated audible probing
++    const int oldRssi = rssiMagnitude();
++    if (oldRssi < 105) return -1;
++    const auto saved = rds_;
++    const auto alternatives = saved.alternatives();
++    if (alternatives.size() < 2) return -1;
++    const auto generation = cancel_.load();
++    const int original = frequency_;
++    const bool wasMuted = muted_;
++    if (!write(0x05, 0x2f, 2)) { down(); return -1; }
++    muted_ = true;
++    int selected = -1;
++    const auto deadline = clock_.nowMs() + 5000;
++    for (size_t n = 0; n < std::min(size_t(2), alternatives.size()); ++n) {
++        const int candidate = alternatives[afCursor_++ % alternatives.size()];
++        if (generation != cancel_.load() || clock_.nowMs() >= deadline) break;
++        if (candidate == original || !tuneLocked(candidate, generation)) continue;
++        int strength = rssiMagnitude();
++        if (strength < 0 || strength > oldRssi - 6) continue;
++        RdsDecoder identity;
++        const auto piDeadline = std::min(deadline, clock_.nowMs() + 1200);
++        while (clock_.nowMs() < piDeadline && generation == cancel_.load()) {
++            if (!fifo(identity)) break;
++            if (identity.pi()) {
++                if (identity.pi() == saved.pi()) selected = candidate;
++                break;
++            }
++            clock_.sleepMs(80);
++        }
++        if (selected > 0) break;
++    }
++    // Never leave the app/UI tuned to an unapproved or different-PI station.
++    restore(original);
++    if (!powered_) return -1;
++    rds_ = saved;
++    muted_ = wasMuted || generation != cancel_.load();
++    if (!write(0x05, muted_ ? 0x2f : 0x2d, 2)) { down(); return -1; }
++    return generation == cancel_.load() ? selected : -1;
++}
+ }  // namespace bcmfm
+diff --git a/fm/BcmFmRadio.h b/fm/BcmFmRadio.h
+index fb04bdc..5d5c752 100644
+--- a/fm/BcmFmRadio.h
++++ b/fm/BcmFmRadio.h
+@@ -2,6 +2,7 @@
+ // Copyright 2026 The LineageOS Project
+ #pragma once
+ #include "BcmFmProtocol.h"
++#include "RdsDecoder.h"
+ #include <atomic>
+ #include <mutex>
+ 
+@@ -35,11 +36,21 @@ public:
+     bool mute(bool muted);
+     bool volume(int value);      // 0..255, receiver digital gain
+     bool alive();
++    bool setRds(bool enabled);
++    int pollRds();
++    std::string programService();
++    std::string radioText();
++    // Probe at most two AFs, require stronger signal AND repeated matching PI,
++    // restore the original channel, then return a recommendation in kHz.
++    int activeAf();
+ private:
+     enum class Search { Found, BandLimit, Error, Cancelled, Timeout };
+     bool write(uint8_t reg, int value, int width = 1);
+     bool read(uint8_t reg, int width, int* value);
+     bool down();
++    bool fifo(RdsDecoder& decoder);
++    bool resetRds();
++    int rssiMagnitude();
+     Search search(int khz, bool seeking, bool up, uint64_t generation, int* found);
+     bool tuneLocked(int khz, uint64_t generation);
+     int seekLocked(int khz, bool up, bool wrap, uint64_t generation);
+@@ -52,5 +63,9 @@ private:
+     bool connected_ = false;
+     bool muted_ = true;
+     int frequency_ = kLowKHz;
++    bool rdsEnabled_ = false;
++    RdsDecoder rds_;
++    int64_t nextAfCheck_ = 0, nextAfAttempt_ = 0;
++    size_t afCursor_ = 0;
+ };
+ }  // namespace bcmfm
+diff --git a/fm/FmJni.cpp b/fm/FmJni.cpp
+index 85cb222..a367819 100644
+--- a/fm/FmJni.cpp
++++ b/fm/FmJni.cpp
+@@ -118,13 +118,24 @@ JNIEXPORT jboolean JNICALL JNI_METHOD(stopScan)(JNIEnv*, jclass) { radio.cancel(
+ JNIEXPORT jint JNICALL JNI_METHOD(setMute)(JNIEnv*, jclass, jboolean mute) { return radio.mute(mute) ? 1 : -1; }
+ JNIEXPORT jboolean JNICALL JNI_METHOD(setBcmVolume)(JNIEnv*, jclass, jint volume) { return radio.volume(volume); }
+ JNIEXPORT jboolean JNICALL JNI_METHOD(isBcmPowered)(JNIEnv*, jclass) { return radio.alive(); }
+-// Explicitly unsupported in the first hardware candidate; do not advertise RDS
+-// or create a polling thread returning fabricated metadata.
+-JNIEXPORT jint JNICALL JNI_METHOD(isRdsSupport)(JNIEnv*, jclass) { return 0; }
+-JNIEXPORT jint JNICALL JNI_METHOD(setRds)(JNIEnv*, jclass, jboolean) { return -1; }
+-JNIEXPORT jshort JNICALL JNI_METHOD(readRds)(JNIEnv*, jclass) { return 0; }
+-JNIEXPORT jbyteArray JNICALL JNI_METHOD(getPs)(JNIEnv*, jclass) { return nullptr; }
+-JNIEXPORT jbyteArray JNICALL JNI_METHOD(getLrText)(JNIEnv*, jclass) { return nullptr; }
+-JNIEXPORT jshort JNICALL JNI_METHOD(activeAf)(JNIEnv*, jclass) { return -1; }
++JNIEXPORT jint JNICALL JNI_METHOD(isRdsSupport)(JNIEnv*, jclass) { return 1; }
++JNIEXPORT jint JNICALL JNI_METHOD(setRds)(JNIEnv*, jclass, jboolean enabled) { return radio.setRds(enabled) ? 0 : -1; }
++JNIEXPORT jshort JNICALL JNI_METHOD(readRds)(JNIEnv*, jclass) { return radio.pollRds(); }
++JNIEXPORT jbyteArray JNICALL JNI_METHOD(getPs)(JNIEnv* env, jclass) {
++    const auto value = radio.programService();
++    jbyteArray result = env->NewByteArray(value.size());
++    if (result) env->SetByteArrayRegion(result, 0, value.size(), reinterpret_cast<const jbyte*>(value.data()));
++    return result;
++}
++JNIEXPORT jbyteArray JNICALL JNI_METHOD(getLrText)(JNIEnv* env, jclass) {
++    const auto value = radio.radioText();
++    jbyteArray result = env->NewByteArray(value.size());
++    if (result) env->SetByteArrayRegion(result, 0, value.size(), reinterpret_cast<const jbyte*>(value.data()));
++    return result;
++}
++JNIEXPORT jshort JNICALL JNI_METHOD(activeAf)(JNIEnv*, jclass) {
++    const int frequency = radio.activeAf();
++    return frequency < 0 ? -1 : frequency / 100;
++}
+ JNIEXPORT jint JNICALL JNI_METHOD(switchAntenna)(JNIEnv*, jclass, jint antenna) { return antenna == 0 ? 0 : 2; }
+ }
+diff --git a/fm/README.md b/fm/README.md
+index 092e0fd..5d71e82 100644
+--- a/fm/README.md
++++ b/fm/README.md
+@@ -11,7 +11,12 @@ steps and hardware caveats. This is an experimental EU-band receiver candidate.
+ * `FmJni.cpp`: authenticated local socket client and FMRadio JNI API. Uses a
+   separate soname; it does not load or copy Samsung's private FM libraries.
+ * `tests/`: pure C++ core tests and broker tests with mock Android boundaries.
++* `RdsDecoder.*` / `RdsCharset.h`: PS, RadioText 2A/2B, PI confirmation, AF lists
++  and G0-to-UTF-8 conversion. The charset table retains its upstream license.
+ 
+-RDS/AF and recording are deliberately unsupported; native RDS capability is 0.
++RDS JNI methods now use the real decoder; AF requires stronger signal and a
++matching confirmed PI. Recording is implemented on the app/audio-policy side
++with explicit FM-input checks. See `../docs/fm-rds-recording.md` for limits and
++hardware validation requirements.
+ The stock kernel's V4L2 radio support remains disabled. No UART/device permissions
+ or Broadcom pin-mux writes are added.
+diff --git a/fm/RdsCharset.h b/fm/RdsCharset.h
+new file mode 100644
+index 0000000..d07bdd3
+--- /dev/null
++++ b/fm/RdsCharset.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (c) Oona Räisänen
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ *
++ */
++// EN 50067 Annex E G0 table, from windytan/redsea src/text/rdsstring.cc.
++#pragma once
++#include <array>
++#include <string_view>
++namespace bcmfm {
++inline constexpr std::array<std::string_view, 256> kRdsChars{{
++    " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", "\n"," ", " ", "\r"," ", " ",
++    " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", "\u00AD",
++    " ", "!", "\"","#", "¤", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/",
++    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";", "<", "=", ">", "?",
++    "@", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
++    "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "[", "\\","]", "―", "_",
++    "‖", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
++    "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "{", "|", "}", "¯", " ",
++    "á", "à", "é", "è", "í", "ì", "ó", "ò", "ú", "ù", "Ñ", "Ç", "Ş", "β", "¡", "Ĳ",
++    "â", "ä", "ê", "ë", "î", "ï", "ô", "ö", "û", "ü", "ñ", "ç", "ş", "ǧ", "ı", "ĳ",
++    "ª", "α", "©", "‰", "Ǧ", "ě", "ň", "ő", "π", "€", "£", "$", "←", "↑", "→", "↓",
++    "º", "¹", "²", "³", "±", "İ", "ń", "ű", "µ", "¿", "÷", "°", "¼", "½", "¾", "§",
++    "Á", "À", "É", "È", "Í", "Ì", "Ó", "Ò", "Ú", "Ù", "Ř", "Č", "Š", "Ž", "Ð", "Ŀ",
++    "Â", "Ä", "Ê", "Ë", "Î", "Ï", "Ô", "Ö", "Û", "Ü", "ř", "č", "š", "ž", "đ", "ŀ",
++    "Ã", "Å", "Æ", "Œ", "ŷ", "Ý", "Õ", "Ø", "Þ", "Ŋ", "Ŕ", "Ć", "Ś", "Ź", "Ŧ", "ð",
++    "ã", "å", "æ", "œ", "ŵ", "ý", "õ", "ø", "þ", "ŋ", "ŕ", "ć", "ś", "ź", "ŧ", " "}};
++}
+diff --git a/fm/RdsDecoder.cpp b/fm/RdsDecoder.cpp
+new file mode 100644
+index 0000000..f3eb8df
+--- /dev/null
++++ b/fm/RdsDecoder.cpp
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "RdsDecoder.h"
++#include "RdsCharset.h"
++#include "BcmFmProtocol.h"
++#include <algorithm>
++
++namespace bcmfm {
++void RdsDecoder::reset() { *this = RdsDecoder{}; }
++void RdsDecoder::clearStation() {
++    if (!ps_.empty()) events_ |= kPs;
++    if (!text_.empty()) events_ |= kRt;
++    ps_.clear(); text_.clear(); af_.clear();
++    psSeen_.fill(0); rtSeen_.fill(0); textMode_ = -1;
++    afPairHits_.fill(0);
++    afCount_ = 0; skipLfMf_ = false; afWork_.clear(); afPrevious_.clear();
++}
++std::string RdsDecoder::utf8(const uint8_t* bytes, size_t length) {
++    std::string result;
++    for (size_t n = 0; n < length && bytes[n] != 0x0d; ++n) {
++        // Do not emit control characters into notifications/database fields.
++        result += bytes[n] < 0x20 ? " " : kRdsChars[bytes[n]];
++    }
++    while (!result.empty() && result.back() == ' ') result.pop_back();
++    return result;
++}
++bool RdsDecoder::feed(const std::vector<uint8_t>& fifo, int tunedKHz, int64_t nowMs) {
++    if (fifo.size() > 240 || fifo.size() % 3 != 0) { next_ = 0; return false; }
++    for (size_t n = 0; n < fifo.size(); n += 3) {
++        const uint8_t status = fifo[n];
++        // Empty/end marker is not an A block and is legal even as the first tuple.
++        if (status == 0x7c && fifo[n+1] == 0xff && fifo[n+2] == 0xff) break;
++        unsigned type = status >> 4;
++        const uint16_t value = (uint16_t(fifo[n+1]) << 8) | fifo[n+2];
++        if (((status >> 2) & 3) == 3 || type > 4) { next_ = 0; continue; }
++        if (type == 0) { blocks_[0] = value; next_ = 1; continue; }
++        if (next_ == 2 && type == 4 && versionB_) type = 2; // C-prime
++        else if (next_ == 2 && type == 2 && versionB_) { next_ = 0; continue; }
++        if (type != next_ || next_ == 0 || next_ > 3) { next_ = 0; continue; }
++        if (type == 1) versionB_ = value & 0x0800;
++        blocks_[next_++] = value;
++        if (next_ == 4) {
++            next_ = 0;
++            if (!versionB_ || blocks_[2] == blocks_[0]) group(tunedKHz, nowMs);
++        }
++    }
++    return true;
++}
++void RdsDecoder::expire(int64_t nowMs) {
++    if (lastGroupMs_ >= 0 && nowMs - lastGroupMs_ >= 15000) {
++        clearStation(); pi_ = candidatePi_ = 0; piHits_ = next_ = 0; lastGroupMs_ = -1;
++    }
++}
++void RdsDecoder::group(int tunedKHz, int64_t nowMs) {
++    if (blocks_[0] == 0) return;
++    if (candidatePi_ != blocks_[0]) { candidatePi_ = blocks_[0]; piHits_ = 0; }
++    if (piHits_ < 2) ++piHits_;
++    // Require a repeated PI before trusting any metadata or AF identity.
++    if (piHits_ < 2) return;
++    if (pi_ != candidatePi_) { clearStation(); pi_ = candidatePi_; }
++    lastGroupMs_ = nowMs;
++    const uint16_t b = blocks_[1], c = blocks_[2], d = blocks_[3];
++    const unsigned type = b >> 12;
++    uint8_t data[4] = {uint8_t(c >> 8), uint8_t(c), uint8_t(d >> 8), uint8_t(d)};
++    if (type == 0) {
++        segment(false, b & 3, data + 2, 2);
++        if (!versionB_) {
++            // Method B repeats pairs containing the tuned transmitter. Confirm
++            // each pair twice; do not interpret LF/MF escapes or EON groups.
++            if (!afCount_ && !skipLfMf_ && data[0] >= 1 && data[0] <= 204 &&
++                data[1] >= 1 && data[1] <= 204) {
++                const int f0 = 87500 + data[0] * 100, f1 = 87500 + data[1] * 100;
++                const int code = f0 == tunedKHz ? data[1] : (f1 == tunedKHz ? data[0] : 0);
++                if (code && 87500 + code * 100 != tunedKHz) {
++                    if (afPairHits_[code] < 2) ++afPairHits_[code];
++                    if (afPairHits_[code] == 2) {
++                        if (af_.empty()) af_.push_back(tunedKHz);
++                        const int frequency = 87500 + code * 100;
++                        if (af_.size() < 25 && std::find(af_.begin(), af_.end(), frequency) == af_.end()) {
++                            af_.push_back(frequency); std::sort(af_.begin(), af_.end());
++                        }
++                    }
++                }
++            }
++            afByte(data[0]); afByte(data[1]);
++        }
++        // Only confirmed lists/pairs containing this transmitter are eligible. Never treat another network's EON list as an AF list.
++        if (!af_.empty() && std::find(af_.begin(), af_.end(), tunedKHz) == af_.end()) af_.clear();
++    } else if (type == 2) {
++        const int mode = ((b >> 4) & 1) | (versionB_ ? 2 : 0);
++        if (mode != textMode_) {
++            rtSeen_.fill(0); rtBytes_.fill(0); textMode_ = mode;
++            if (!text_.empty()) { text_.clear(); events_ |= kRt; }
++        }
++        segment(true, b & 15, versionB_ ? data + 2 : data, versionB_ ? 2 : 4);
++    }
++}
++void RdsDecoder::segment(bool rt, unsigned index, const uint8_t* data, unsigned count) {
++    uint8_t* bytes = rt ? rtBytes_.data() : psBytes_.data();
++    uint8_t* seen = rt ? rtSeen_.data() : psSeen_.data();
++    const unsigned segments = rt ? 16 : 4;
++    if (index >= segments) return;
++    const unsigned offset = index * count;
++    if (!std::equal(data, data + count, bytes + offset)) {
++        // PS has no A/B flag; discard the partial cycle on a changed segment to
++        // avoid stitching a scrolling PS or corrupt block onto the old name.
++        if (seen[index]) std::fill(seen, seen + segments, 0);
++        std::copy(data, data + count, bytes + offset); seen[index] = 1;
++    } else if (seen[index] < 2) ++seen[index];
++    unsigned length = segments * count;
++    if (rt) {
++        for (unsigned n = 0; n < length; ++n) {
++            if (seen[n / count] && bytes[n] == 0x0d) { length = n; break; }
++        }
++    }
++    // Include the terminator's segment in the confirmation requirement.
++    const unsigned needed = std::min(segments, length / count + 1);
++    for (unsigned n = 0; n < (rt ? needed : segments); ++n) if (seen[n] < 2) return;
++    std::string value = utf8(bytes, length);
++    std::string& published = rt ? text_ : ps_;
++    if (published != value) { published = std::move(value); events_ |= rt ? kRt : kPs; }
++}
++void RdsDecoder::afByte(uint8_t code) {
++    if (skipLfMf_) { skipLfMf_ = false; return; }
++    if (code == 250) { skipLfMf_ = true; return; }
++    if (code >= 224 && code <= 249) {
++        afCount_ = code - 224; afWork_.clear();
++        if (!afCount_) { af_.clear(); afPrevious_.clear(); afPairHits_.fill(0); }
++        return;
++    }
++    if (!afCount_ || code < 1 || code > 204) return;
++    const int khz = 87500 + code * 100;
++    if (validFrequency(khz) && std::find(afWork_.begin(), afWork_.end(), khz) == afWork_.end())
++        afWork_.push_back(khz);
++    if (afWork_.size() == afCount_) {
++        std::sort(afWork_.begin(), afWork_.end());
++        if (afWork_ == afPrevious_) af_ = afWork_;
++        afPrevious_ = afWork_; afCount_ = 0;
++    }
++}
++} // namespace bcmfm
+diff --git a/fm/RdsDecoder.h b/fm/RdsDecoder.h
+new file mode 100644
+index 0000000..acf013e
+--- /dev/null
++++ b/fm/RdsDecoder.h
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <array>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace bcmfm {
++// Decoder for the Broadcom FIFO tuples [status, MSB, LSB], not raw RF bits.
++// Firmware corrects CRC; reject uncorrectable blocks and broken group ordering.
++class RdsDecoder {
++public:
++    static constexpr int kPs = 0x0008, kRt = 0x0040, kAf = 0x0080;
++    void reset();
++    bool feed(const std::vector<uint8_t>& fifo, int tunedKHz, int64_t nowMs);
++    void expire(int64_t nowMs);
++    int takeEvents() { int result = events_; events_ = 0; return result; }
++    uint16_t pi() const { return pi_; }
++    const std::string& ps() const { return ps_; }
++    const std::string& text() const { return text_; }
++    const std::vector<int>& alternatives() const { return af_; }
++    static std::string utf8(const uint8_t* text, size_t length);
++private:
++    void group(int tunedKHz, int64_t nowMs);
++    void clearStation();
++    void afByte(uint8_t code);
++    void segment(bool rt, unsigned index, const uint8_t* data, unsigned count);
++    std::array<uint16_t, 4> blocks_{};
++    unsigned next_ = 0;
++    uint16_t pi_ = 0, candidatePi_ = 0;
++    unsigned piHits_ = 0;
++    bool versionB_ = false;
++    int events_ = 0;
++    int64_t lastGroupMs_ = -1;
++    std::string ps_, text_;
++    std::array<uint8_t, 64> rtBytes_{};
++    std::array<uint8_t, 8> psBytes_{};
++    std::array<uint8_t, 16> rtSeen_{};
++    std::array<uint8_t, 4> psSeen_{};
++    int textMode_ = -1;
++    unsigned afCount_ = 0;
++    bool skipLfMf_ = false;
++    std::vector<int> afWork_, afPrevious_, af_;
++    std::array<uint8_t, 205> afPairHits_{};
++};
++} // namespace bcmfm
+diff --git a/fm/tests/radio_test.cpp b/fm/tests/radio_test.cpp
+index 21296bb..475225b 100644
+--- a/fm/tests/radio_test.cpp
++++ b/fm/tests/radio_test.cpp
+@@ -19,7 +19,8 @@ struct FakeBus : Bus {
+     int opens = 0, closes = 0, failAt = -1, wrongTune = 0, forcedSeek = 0;
+     int flags = 0;
+     std::vector<int> stations{88000, 94500, 101100, 108000};
+-    std::map<int, int> registers;
++    std::map<int, int> registers, rssiByStation;
++    std::map<int, Bytes> rdsByStation;
+     std::vector<Bytes> calls;
+     std::function<void()> exchangeHook;
+     bool open() override { ++opens; return opened = available; }
+@@ -56,6 +57,15 @@ struct FakeBus : Bus {
+                 }
+             }
+         } else {
++            if (reg == 0x80) {
++                const auto found = rdsByStation.find(registers[0x0a] + 64000);
++                const Bytes fifo = found == rdsByStation.end() ? Bytes{0x7c,0xff,0xff} : found->second;
++                result->insert(result->end(), fifo.begin(), fifo.end());
++                (*result)[1] = result->size() - 2;
++                return true;
++            }
++            if (reg == 0x0f && rssiByStation.count(registers[0x0a] + 64000))
++                registers[0x0f] = rssiByStation[registers[0x0a] + 64000];
+             int value = reg == 0x12 ? (noCompletion ? 0 : flags) : registers[reg];
+             if (reg == 0x12) flags = 0;
+             result->push_back(value & 255);
+@@ -75,6 +85,23 @@ struct Fixture {
+     FakeBus bus;
+     Radio radio{bus, clock};
+ };
++Bytes stationRds(uint16_t pi) {
++    Bytes result;
++    for(int round=0;round<3;++round) for(int n=0;n<4;++n) {
++        const uint16_t af = n == 0 ? 0xe205 : (n == 1 ? 0x46cd : 0xcdcd);
++        Bytes group{0,uint8_t(pi>>8),uint8_t(pi),0x10,0,uint8_t(n),
++                    0x20,uint8_t(af>>8),uint8_t(af),0x30,'A','A'};
++        result.insert(result.end(),group.begin(),group.end());
++    }
++    return result;
++}
++void afSetup(Fixture& f, uint16_t candidatePi = 0x1234) {
++    assert(f.radio.powerUp(88000)); assert(f.radio.setRds(true)); assert(f.radio.mute(false));
++    f.bus.rdsByStation[88000] = stationRds(0x1234);
++    f.bus.rdsByStation[94500] = stationRds(candidatePi);
++    f.bus.rssiByStation = {{88000,18},{94500,38}}; // -110 dBm vs -90 dBm
++    assert(f.radio.pollRds() & RdsDecoder::kAf);
++}
+ int main() {
+     int tests = 0;
+     auto test = [&](const char* name, const std::function<void()>& body) {
+@@ -98,7 +125,7 @@ int main() {
+         }
+         for (Bytes bad : {Bytes{0x61, 0xfc, 5, 7, 0x19, 0x18, 0x19, 0x19},
+                          Bytes{0x15, 0xfc, 4, 0xf8, 0, 0, 1},
+-                         Bytes{0x15, 0xfc, 3, 0x00, 0, 3},
++                         Bytes{0x15, 0xfc, 3, 0x00, 0, 2},
+                          Bytes{0x15, 0xfc, 3, 0x4d, 0, 0x80},
+                          Bytes{0x15, 0xfc, 3, 0x80, 1, 128}})
+             assert(!allowed(bad.data(), bad.size()));
+@@ -242,5 +269,55 @@ int main() {
+         assert(!f.radio.alive()); assert(!f.bus.opened);
+         assert(!f.radio.tune(94500));
+     });
++    test("RDS enable, short FIFO, disable and channel reset", [] {
++        Fixture f; assert(f.radio.powerUp(88000)); assert(f.radio.setRds(true));
++        assert(f.bus.registers[0]==3 && f.bus.wrote(2,2) && f.bus.wrote(0x14,64));
++        f.bus.rdsByStation[88000]=stationRds(0x1234);
++        assert(f.radio.pollRds() & RdsDecoder::kPs);
++        assert(f.radio.programService()=="AAAAAAAA");
++        assert(f.radio.tune(94500));assert(f.radio.programService().empty());
++        assert(f.radio.pollRds()==0); // empty marker on another channel
++        assert(f.radio.setRds(false));assert(f.bus.registers[0]==1);
++        auto calls=f.bus.calls.size();assert(f.radio.pollRds()==0 && f.bus.calls.size()==calls);
++    });
++    test("each RDS initialization failure powers down", [] {
++        for(int stage=1;stage<=3;++stage) {
++            Fixture f;assert(f.radio.powerUp(88000));f.bus.failAt=f.bus.calls.size()+stage;
++            assert(!f.radio.setRds(true));assert(!f.bus.opened && f.bus.registers[0]==0);
++        }
++    });
++    test("RDS FIFO corruption and link loss fail closed", [] {
++        Fixture f;assert(f.radio.powerUp(88000));assert(f.radio.setRds(true));
++        f.bus.rdsByStation[88000]={0,1};assert(!f.radio.pollRds());assert(!f.bus.opened);
++        assert(f.radio.powerUp(88000));assert(f.radio.setRds(true));f.bus.available=false;
++        assert(!f.radio.pollRds());assert(!f.bus.opened);
++    });
++    test("AF recommends only stronger matching PI and restores channel/mute", [] {
++        Fixture f;afSetup(f);assert(f.radio.activeAf()==94500);
++        assert(f.bus.registers[0x0a]+64000==88000 && f.bus.registers[5]==0x2d);
++        assert(f.radio.programService()=="AAAAAAAA");
++        auto calls=f.bus.calls.size();assert(f.radio.activeAf()==-1 && f.bus.calls.size()==calls);
++    });
++    test("AF rejects different PI even with stronger signal", [] {
++        Fixture f;afSetup(f,0x9999);assert(f.radio.activeAf()==-1);
++        assert(f.bus.registers[0x0a]+64000==88000 && f.bus.registers[5]==0x2d);
++    });
++    test("AF hysteresis rejects a marginal candidate", [] {
++        Fixture f;afSetup(f);f.bus.rssiByStation[94500]=20;assert(f.radio.activeAf()==-1);
++        assert(f.bus.registers[0x0a]+64000==88000);
++    });
++    test("AF PI timeout is bounded and restores", [] {
++        Fixture f;afSetup(f);f.bus.rdsByStation.erase(94500);
++        auto start=f.clock.time;assert(f.radio.activeAf()==-1);assert(f.clock.time-start<=1280);
++        assert(f.bus.registers[0x0a]+64000==88000);
++    });
++    test("AF cancellation restores but never unmutes after focus loss", [] {
++        Fixture f;afSetup(f);
++        f.bus.exchangeHook=[&] {
++            if(f.bus.calls.back()[3]==0x80 && f.bus.registers[0x0a]+64000==94500)f.radio.cancel();
++        };
++        assert(f.radio.activeAf()==-1);
++        assert(f.bus.registers[0x0a]+64000==88000 && f.bus.registers[5]==0x2f);
++    });
+     std::cout << tests << " native tests passed\n";
+ }
+diff --git a/fm/tests/rds_test.cpp b/fm/tests/rds_test.cpp
+new file mode 100644
+index 0000000..4f73240
+--- /dev/null
++++ b/fm/tests/rds_test.cpp
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "RdsDecoder.h"
++#include "BcmFmProtocol.h"
++#include <cassert>
++#include <functional>
++#include <iostream>
++#include <random>
++using namespace bcmfm;
++using Bytes = std::vector<uint8_t>;
++Bytes group(uint16_t pi, uint16_t b, uint16_t c, uint16_t d) {
++    return {0, uint8_t(pi>>8), uint8_t(pi), 0x10, uint8_t(b>>8), uint8_t(b),
++            uint8_t(b & 0x0800 ? 0x40 : 0x20), uint8_t(c>>8), uint8_t(c),
++            0x30, uint8_t(d>>8), uint8_t(d)};
++}
++void ps(RdsDecoder& r, const std::string& text, uint16_t pi = 0x1234, bool b = false) {
++    assert(text.size() == 8);
++    for (int round = 0; round < 3; ++round)
++        for (int n = 0; n < 4; ++n)
++            r.feed(group(pi, (b ? 0x0800 : 0) | n, b ? pi : 0,
++                         (uint8_t(text[2*n]) << 8) | uint8_t(text[2*n+1])), 88000, 0);
++}
++int main() {
++    int total = 0;
++    auto test = [&](const char* name, const std::function<void()>& f) {
++        f(); ++total; std::cout << "PASS RDS " << name << '\n';
++    };
++    test("FIFO framing and exact register permissions", [] {
++        Bytes req{0x15,0xfc,3,0x80,1,240};
++        assert(allowed(req.data(),req.size()));
++        for (int n : {0,1,2,3,128,239,241,255}) {
++            req[5]=n; assert(!allowed(req.data(),req.size()));
++        }
++        req[5]=240;
++        for (int n=0;n<=243;++n) {
++            Bytes evt{0x0e,uint8_t(6+n),1,0x15,0xfc,0,0x80,1}; evt.resize(8+n);
++            Bytes data; assert(response(req,evt,&data)==(n<=240 && n%3==0));
++        }
++        Bytes read{0x15,0xfc,3,0x12,1,2}, shortReply{0x0e,6,1,0x15,0xfc,0,0x12,1}, data;
++        assert(!response(read,shortReply,&data));
++    });
++    test("PS repetition and event consumption", [] {
++        RdsDecoder r; r.feed(group(0x1234,0,0,0x5445),88000,0); assert(!r.pi());
++        ps(r,"TEST FM "); assert(r.pi()==0x1234 && r.ps()=="TEST FM");
++        assert(r.takeEvents()==RdsDecoder::kPs); assert(!r.takeEvents());
++        ps(r,"TEST FM "); assert(!r.takeEvents());
++    });
++    test("0B C-prime identity", [] {
++        RdsDecoder r; ps(r,"B RADIO ",0x2345,true); assert(r.ps()=="B RADIO");
++        auto bad=group(0x3456,0x0800,0x9999,0x5858);
++        for(int n=0;n<10;++n) r.feed(bad,88000,0);
++        assert(r.pi()==0x2345);
++    });
++    test("corrected blocks accepted, uncorrectable blocks rejected", [] {
++        RdsDecoder r;
++        for (int round=0;round<4;++round) for(int n=0;n<4;++n) {
++            auto data=group(0x1234,n,0,0x4141); data[9]|=0x04;
++            r.feed(data,88000,0);
++        }
++        assert(r.ps()=="AAAAAAAA"); r.reset();
++        for (int round=0;round<4;++round) for(int n=0;n<4;++n) {
++            auto data=group(0x1234,n,0,0x4141); data[9]|=0x0c;
++            r.feed(data,88000,0);
++        }
++        assert(r.ps().empty() && !r.pi());
++    });
++    test("fragmented FIFO groups and empty markers", [] {
++        RdsDecoder r; auto g=group(0x1234,0,0,0x4141);
++        for(int n=0;n<2;++n) {
++            r.feed(Bytes(g.begin(),g.begin()+6),88000,0);
++            r.feed({0x7c,0xff,0xff},88000,0);
++            r.feed(Bytes(g.begin()+6,g.end()),88000,0);
++        }
++        assert(r.pi()==0x1234);
++    });
++    test("end marker stops decoding padded data", [] {
++        RdsDecoder r; auto g=group(0x1234,0,0,0);
++        Bytes data{0x7c,0xff,0xff};data.insert(data.end(),g.begin(),g.end());
++        r.feed(data,88000,0);r.feed(data,88000,0);assert(!r.pi());
++    });
++    test("group ordering and malformed payloads", [] {
++        RdsDecoder r; auto g=group(0x1234,0,0,0);
++        std::swap(g[3],g[6]);
++        for(int n=0;n<3;++n)r.feed(g,88000,0);
++        assert(!r.pi());assert(!r.feed({0,1},88000,0));assert(!r.feed(Bytes(243),88000,0));
++    });
++    test("2A text and terminator confirmation", [] {
++        RdsDecoder r;
++        for (int n=0;n<3;++n) {
++            r.feed(group(0x1234,0x2000,0x4865,0x6c6c),88000,0);
++            r.feed(group(0x1234,0x2001,0x6f0d,0x7878),88000,0);
++        }
++        assert(r.text()=="Hello"); assert(r.takeEvents()&RdsDecoder::kRt);
++        r.feed(group(0x1234,0x2010,0x4e65,0x770d),88000,0);
++        assert(r.text().empty()); // A/B change invalidates old text immediately
++        r.feed(group(0x1234,0x2010,0x4e65,0x770d),88000,0); assert(r.text()=="New");
++    });
++    test("2B text and full length 32/64 strings", [] {
++        RdsDecoder r;
++        for(int round=0;round<3;++round) for(int n=0;n<16;++n)
++            r.feed(group(0x1234,0x2800|n,0x1234,0x4242),88000,0);
++        assert(r.text()==std::string(32,'B'));
++        for(int round=0;round<3;++round) for(int n=0;n<16;++n)
++            r.feed(group(0x1234,0x2000|n,0x4141,0x4141),88000,0);
++        assert(r.text()==std::string(64,'A'));
++    });
++    test("PI change and inactivity invalidate metadata", [] {
++        RdsDecoder r; ps(r,"OLD NAME");r.takeEvents();
++        r.feed(group(0x4321,0x1000,0,0),88000,0);assert(r.ps()=="OLD NAME");
++        r.feed(group(0x4321,0x1000,0,0),88000,0);assert(r.ps().empty());
++        assert(r.takeEvents()&RdsDecoder::kPs);
++        ps(r,"NEW NAME");r.takeEvents();r.expire(15000);assert(!r.pi()&&r.ps().empty());
++        assert(r.takeEvents()&RdsDecoder::kPs);
++    });
++    test("PS change never publishes a mixed name", [] {
++        RdsDecoder r; ps(r,"OLD NAME");r.takeEvents();
++        r.feed(group(0x1234,0,0,0x4e45),88000,0);assert(!r.takeEvents());
++        r.feed(group(0x1234,0,0,0x4e45),88000,0);assert(r.ps()=="OLD NAME");
++        ps(r,"NEW NAME");assert(r.ps()=="NEW NAME");
++    });
++    test("G0 character conversion rather than Latin-1 or platform charset", [] {
++        const uint8_t data[]={0x91,0x99,0x8e,0xa9,0x24,0x0d,0x41};
++        assert(RdsDecoder::utf8(data,sizeof(data))=="äü¡€¤");
++        uint8_t controls[]={1,0x1b,0x41};assert(RdsDecoder::utf8(controls,3)=="  A");
++    });
++    test("complete repeated Method-A AF list", [] {
++        RdsDecoder r;
++        for(int n=0;n<3;++n) {
++            r.feed(group(0x1234,0,0xe205,0),88000,0);
++            r.feed(group(0x1234,1,0x46cd,0),88000,0);
++        }
++        assert(r.alternatives()==std::vector<int>({88000,94500}));
++        r.feed(group(0x1234,0,0xe000,0),88000,0);assert(r.alternatives().empty());
++    });
++    test("LF/MF escape and other networks cannot become FM AFs", [] {
++        RdsDecoder r;
++        for(int n=0;n<5;++n) {
++            r.feed(group(0x1234,0,0xe205,0),88000,0);
++            r.feed(group(0x1234,0,0xfa46,0),88000,0);
++        }
++        assert(r.alternatives().empty());
++        for(int n=0;n<5;++n) {
++            r.feed(group(0x1234,0,0xe20a,0),88000,0);
++            r.feed(group(0x1234,0,0x46cd,0),88000,0);
++        }
++        assert(r.alternatives().empty());
++    });
++    test("Method-B pairs require tuned transmitter and repetition", [] {
++        RdsDecoder r;
++        for(int n=0;n<3;++n) r.feed(group(0x1234,0,0x0546,0),88000,0);
++        assert(r.alternatives()==std::vector<int>({88000,94500}));
++        for(int n=0;n<3;++n) r.feed(group(0x1234,0,0x4760,0),88000,0);
++        assert(r.alternatives().size()==2);
++        r.reset(); for(int n=0;n<3;++n) r.feed(group(0x1234,0xe000,0x0546,0),88000,0);
++        assert(r.alternatives().empty()); // EON describes another network
++    });
++    test("random malformed input is bounded", [] {
++        std::mt19937 gen(7870);RdsDecoder r;
++        for(int n=0;n<20000;++n) {
++            Bytes data(gen()%300);for(auto& byte:data)byte=gen();
++            r.feed(data,88000,n);r.expire(n);r.takeEvents();
++            assert(r.ps().size()<=24 && r.text().size()<=192 && r.alternatives().size()<=25);
++        }
++    });
++    std::cout << total << " RDS tests passed\n";
++}
+diff --git a/fm/tests/run_host_tests.py b/fm/tests/run_host_tests.py
+index 92b4cec..821e88d 100644
+--- a/fm/tests/run_host_tests.py
++++ b/fm/tests/run_host_tests.py
+@@ -26,9 +26,13 @@ def main():
+         flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+     with tempfile.TemporaryDirectory(prefix="bcm-fm-host-") as directory:
+         binary = str(Path(directory) / "radio-test")
+-        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "BcmFmRadio.cpp"),
++        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "BcmFmRadio.cpp"), str(source / "RdsDecoder.cpp"),
+                         str(tests / "radio_test.cpp"), "-o", binary], check=True)
+         subprocess.run([binary], check=True)
++        binary = str(Path(directory) / "rds-test")
++        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "RdsDecoder.cpp"),
++                        str(tests / "rds_test.cpp"), "-o", binary], check=True)
++        subprocess.run([binary], check=True)
+         if args.bt_tree:
+             bt = args.bt_tree.resolve()
+             header = bt / "btif/include/BcmFmProtocol.h"
+diff --git a/fm/tests/server_test.cpp b/fm/tests/server_test.cpp
+index f5cbb4e..c17bb71 100644
+--- a/fm/tests/server_test.cpp
++++ b/fm/tests/server_test.cpp
+@@ -38,9 +38,10 @@ void transmit(BT_HDR* command, Complete complete, Status status, void* token) {
+     callbacks.emplace_back([=] {
+         std::this_thread::sleep_for(std::chrono::milliseconds(mode == 1 ? 1750 : 10));
+         if (mode == 2) { status(0x0c, command, token); return; }
+-        auto* event = static_cast<BT_HDR*>(osi_calloc(sizeof(BT_HDR) + 8));
+-        event->len = 8;
+-        const uint8_t bytes[] = {0x0e, 6, 1, 0x15, 0xfc, 0, command->data[3], command->data[4]};
++        const int size = mode == 3 && command->data[3] == 0x80 ? 248 : 8;
++        auto* event = static_cast<BT_HDR*>(osi_calloc(sizeof(BT_HDR) + size));
++        event->len = size;
++        const uint8_t bytes[] = {0x0e, uint8_t(size - 2), 1, 0x15, 0xfc, 0, command->data[3], command->data[4]};
+         memcpy(event->data, bytes, sizeof(bytes));
+         complete(event, token);  // callback owns event
+         osi_free(command);       // HCI owns command on Command Complete
+@@ -133,4 +134,19 @@ int main() {
+     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
+     close(client); drain(); btif_bcm_fm_stop();
+     std::cout << "PASS adapter shutdown unblocks an outstanding request\n";
++    behavior = 3; btif_bcm_fm_start(); client = connectClient();
++    const std::vector<uint8_t> fifo{0x15,0xfc,3,0x80,1,240};
++    assert(send(client, fifo.data(), fifo.size(), MSG_NOSIGNAL)==6);
++    uint8_t packet[257];
++    const auto length = recv(client, packet, sizeof(packet), MSG_TRUNC);
++    assert(length==248);
++    std::vector<uint8_t> data;
++    assert(bcmfm::response(fifo, {packet, packet+length}, &data) && data.size()==240);
++    count = transmissions;
++    assert(request(client, {0x15,0xfc,3,0x80,1,239})<=0); // no arbitrary FIFO/memory length
++    close(client); waitFor([&] { return transmissions==count+1; }); drain();
++    assert(transmissions==count+1); // only cleanup OFF
++    btif_bcm_fm_stop(); drain();
++    std::cout << "PASS bounded RDS FIFO socket payload and invalid length rejection\n";
++
+ }

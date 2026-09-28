@@ -3,4 +3,5 @@
 <resources>
     <string name="bcm_fm_enable_bluetooth">Enable Bluetooth before using FM radio. Wired headphones are required as the antenna.</string>
     <string name="bcm_fm_failed">FM radio is unavailable. This experimental backend needs device testing; check the BcmFm and bt_bcm_fm logs.</string>
+    <string name="bcm_fm_capture_failed">FM recording is unavailable. Check recording permission and the FM tuner input. Microphone fallback is disabled.</string>
 </resources>

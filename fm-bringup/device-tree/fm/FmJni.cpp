@@ -118,13 +118,24 @@ JNIEXPORT jboolean JNICALL JNI_METHOD(stopScan)(JNIEnv*, jclass) { radio.cancel(
 JNIEXPORT jint JNICALL JNI_METHOD(setMute)(JNIEnv*, jclass, jboolean mute) { return radio.mute(mute) ? 1 : -1; }
 JNIEXPORT jboolean JNICALL JNI_METHOD(setBcmVolume)(JNIEnv*, jclass, jint volume) { return radio.volume(volume); }
 JNIEXPORT jboolean JNICALL JNI_METHOD(isBcmPowered)(JNIEnv*, jclass) { return radio.alive(); }
-// Explicitly unsupported in the first hardware candidate; do not advertise RDS
-// or create a polling thread returning fabricated metadata.
-JNIEXPORT jint JNICALL JNI_METHOD(isRdsSupport)(JNIEnv*, jclass) { return 0; }
-JNIEXPORT jint JNICALL JNI_METHOD(setRds)(JNIEnv*, jclass, jboolean) { return -1; }
-JNIEXPORT jshort JNICALL JNI_METHOD(readRds)(JNIEnv*, jclass) { return 0; }
-JNIEXPORT jbyteArray JNICALL JNI_METHOD(getPs)(JNIEnv*, jclass) { return nullptr; }
-JNIEXPORT jbyteArray JNICALL JNI_METHOD(getLrText)(JNIEnv*, jclass) { return nullptr; }
-JNIEXPORT jshort JNICALL JNI_METHOD(activeAf)(JNIEnv*, jclass) { return -1; }
+JNIEXPORT jint JNICALL JNI_METHOD(isRdsSupport)(JNIEnv*, jclass) { return 1; }
+JNIEXPORT jint JNICALL JNI_METHOD(setRds)(JNIEnv*, jclass, jboolean enabled) { return radio.setRds(enabled) ? 0 : -1; }
+JNIEXPORT jshort JNICALL JNI_METHOD(readRds)(JNIEnv*, jclass) { return radio.pollRds(); }
+JNIEXPORT jbyteArray JNICALL JNI_METHOD(getPs)(JNIEnv* env, jclass) {
+    const auto value = radio.programService();
+    jbyteArray result = env->NewByteArray(value.size());
+    if (result) env->SetByteArrayRegion(result, 0, value.size(), reinterpret_cast<const jbyte*>(value.data()));
+    return result;
+}
+JNIEXPORT jbyteArray JNICALL JNI_METHOD(getLrText)(JNIEnv* env, jclass) {
+    const auto value = radio.radioText();
+    jbyteArray result = env->NewByteArray(value.size());
+    if (result) env->SetByteArrayRegion(result, 0, value.size(), reinterpret_cast<const jbyte*>(value.data()));
+    return result;
+}
+JNIEXPORT jshort JNICALL JNI_METHOD(activeAf)(JNIEnv*, jclass) {
+    const int frequency = radio.activeAf();
+    return frequency < 0 ? -1 : frequency / 100;
+}
 JNIEXPORT jint JNICALL JNI_METHOD(switchAntenna)(JNIEnv*, jclass, jint antenna) { return antenna == 0 ? 0 : 2; }
 }

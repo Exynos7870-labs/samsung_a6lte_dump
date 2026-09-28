@@ -139,6 +139,12 @@ PRODUCT_COPY_FILES += \
 # Properties
 -include $(DEVICE_PATH)/vendor_prop.mk
 
+# A6-specific copy must precede common inheritance: the first destination wins.
+# Same pinned SEC policy as common, with its existing FM input attached so an
+# explicit RADIO_TUNER AudioRecord can select it. Other routes stay unchanged.
+PRODUCT_COPY_FILES += \
+    $(DEVICE_PATH)/configs/audio/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml
+
 # Inherit from common
 $(call inherit-product, device/samsung/universal7870-common/device-common.mk)
 

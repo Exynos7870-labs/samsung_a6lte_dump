@@ -93,6 +93,8 @@ bool Radio::down() {
         ok = write(0x00, 0);
         bus_.close();
     }
+    rdsEnabled_ = false;
+    rds_.reset();
     powered_ = connected_ = false;
     muted_ = true;
     return ok;
@@ -106,6 +108,7 @@ bool Radio::powerDown() {
 Radio::Search Radio::search(int khz, bool seeking, bool up, uint64_t generation, int* found) {
     if (!powered_ || !validFrequency(khz)) return Search::Error;
     if (generation != cancel_.load()) return Search::Cancelled;
+    if (!resetRds()) return Search::Error;
     int stale;
     if (!write(0x09, 0) || !read(0x12, 2, &stale) ||
         (seeking && !write(0x07, 105 | (up ? 0x80 : 0))) ||
@@ -131,6 +134,7 @@ Radio::Search Radio::search(int khz, bool seeking, bool up, uint64_t generation,
                 return Search::Error;
             }
             frequency_ = *found;
+            if (!resetRds()) return Search::Error;
             return Search::Found;
         }
         clock_.sleepMs(40);
@@ -222,5 +226,93 @@ bool Radio::alive() {
     if (powered_ && read(0x00, 1, &system) && (system & 1)) return true;
     if (connected_) down();
     return false;
+}
+bool Radio::resetRds() {
+    rds_.reset();
+    return !rdsEnabled_ || write(0x02, 2);
+}
+bool Radio::fifo(RdsDecoder& decoder) {
+    Bytes request{0x15, 0xfc, 3, 0x80, 1, 240}, event, data;
+    return bus_.exchange(request, &event) && response(request, event, &data) &&
+           decoder.feed(data, frequency_, clock_.nowMs());
+}
+bool Radio::setRds(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rds_.reset();
+    rdsEnabled_ = false;
+    if (!powered_) return !enabled;
+    if (!write(0x00, enabled ? 3 : 1) ||
+        (enabled && (!write(0x02, 2) || !write(0x14, 64)))) {
+        logError("RDS initialization failed");
+        down(); return false;
+    }
+    rdsEnabled_ = enabled;
+    nextAfCheck_ = 0;
+    return true;
+}
+int Radio::rssiMagnitude() {
+    int raw;
+    return read(0x0f, 1, &raw) ? ((0x80 - raw) & 0x7f) : -1;
+}
+int Radio::pollRds() {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || !powered_ || !rdsEnabled_) return 0;
+    if (!fifo(rds_)) { logError("RDS FIFO read failed"); down(); return 0; }
+    rds_.expire(clock_.nowMs());
+    int events = rds_.takeEvents();
+    if (clock_.nowMs() >= nextAfCheck_ && clock_.nowMs() >= nextAfAttempt_ &&
+        rds_.pi() && rds_.alternatives().size() > 1) {
+        nextAfCheck_ = clock_.nowMs() + 2000;
+        if (rssiMagnitude() >= 105) events |= RdsDecoder::kAf;
+    }
+    return events;
+}
+std::string Radio::programService() {
+    std::lock_guard<std::mutex> lock(mutex_); return rds_.ps();
+}
+std::string Radio::radioText() {
+    std::lock_guard<std::mutex> lock(mutex_); return rds_.text();
+}
+int Radio::activeAf() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!powered_ || !rdsEnabled_ || !rds_.pi() || clock_.nowMs() < nextAfAttempt_) return -1;
+    nextAfAttempt_ = clock_.nowMs() + 30000; // no repeated audible probing
+    const int oldRssi = rssiMagnitude();
+    if (oldRssi < 105) return -1;
+    const auto saved = rds_;
+    const auto alternatives = saved.alternatives();
+    if (alternatives.size() < 2) return -1;
+    const auto generation = cancel_.load();
+    const int original = frequency_;
+    const bool wasMuted = muted_;
+    if (!write(0x05, 0x2f, 2)) { down(); return -1; }
+    muted_ = true;
+    int selected = -1;
+    const auto deadline = clock_.nowMs() + 5000;
+    for (size_t n = 0; n < std::min(size_t(2), alternatives.size()); ++n) {
+        const int candidate = alternatives[afCursor_++ % alternatives.size()];
+        if (generation != cancel_.load() || clock_.nowMs() >= deadline) break;
+        if (candidate == original || !tuneLocked(candidate, generation)) continue;
+        int strength = rssiMagnitude();
+        if (strength < 0 || strength > oldRssi - 6) continue;
+        RdsDecoder identity;
+        const auto piDeadline = std::min(deadline, clock_.nowMs() + 1200);
+        while (clock_.nowMs() < piDeadline && generation == cancel_.load()) {
+            if (!fifo(identity)) break;
+            if (identity.pi()) {
+                if (identity.pi() == saved.pi()) selected = candidate;
+                break;
+            }
+            clock_.sleepMs(80);
+        }
+        if (selected > 0) break;
+    }
+    // Never leave the app/UI tuned to an unapproved or different-PI station.
+    restore(original);
+    if (!powered_) return -1;
+    rds_ = saved;
+    muted_ = wasMuted || generation != cancel_.load();
+    if (!write(0x05, muted_ ? 0x2f : 0x2d, 2)) { down(); return -1; }
+    return generation == cancel_.load() ? selected : -1;
 }
 }  // namespace bcmfm

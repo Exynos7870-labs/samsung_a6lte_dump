@@ -741,10 +741,6 @@ public class FmMainActivity extends Activity implements FmFavoriteEditDialog.Edi
     public boolean onCreateOptionsMenu(Menu menu) {
         MenuInflater inflater = getMenuInflater();
         inflater.inflate(R.menu.fm_action_bar, menu);
-        if (getResources().getBoolean(R.bool.config_bcmHciFm)) {
-            menu.findItem(R.id.fm_start_record).setVisible(false);
-            menu.findItem(R.id.fm_record_list).setVisible(false);
-        }
         mMenuItemStationlList = menu.findItem(R.id.fm_station_list);
         mMenuItemHeadset = menu.findItem(R.id.fm_headset);
         mMenuItemStartRecord = menu.findItem(R.id.fm_start_record);

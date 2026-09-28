@@ -26,8 +26,12 @@ def main():
         flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     with tempfile.TemporaryDirectory(prefix="bcm-fm-host-") as directory:
         binary = str(Path(directory) / "radio-test")
-        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "BcmFmRadio.cpp"),
+        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "BcmFmRadio.cpp"), str(source / "RdsDecoder.cpp"),
                         str(tests / "radio_test.cpp"), "-o", binary], check=True)
+        subprocess.run([binary], check=True)
+        binary = str(Path(directory) / "rds-test")
+        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "RdsDecoder.cpp"),
+                        str(tests / "rds_test.cpp"), "-o", binary], check=True)
         subprocess.run([binary], check=True)
         if args.bt_tree:
             bt = args.bt_tree.resolve()

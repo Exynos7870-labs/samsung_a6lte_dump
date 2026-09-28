@@ -138,8 +138,9 @@ the companion patch series. No kernel radio driver or stock APK transplant is
 used. See [fm-integration.md](fm-integration.md) for implementation details.
 
 Remaining work is an Android/SELinux build, phone validation of the inferred
-protocol and audio sequence, and implementation/validation of the deliberately
-disabled RDS/AF and recording features. Regional modes beyond the EU band,
+protocol, RDS FIFO and playback/capture sequence. RDS PS/RadioText, PI-checked AF
+and FM-only recording are now implemented in the follow-up series; see
+[fm-rds-recording.md](fm-rds-recording.md). Regional modes beyond the EU band,
 secondary users, and FM-to-Bluetooth audio are not supported in this candidate.
 Normal Bluetooth/Wi-Fi coexistence also needs hardware testing. A stock trace
 can refine the implementation later; new-ROM failure logs can be used first.

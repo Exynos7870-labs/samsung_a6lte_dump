@@ -2,6 +2,7 @@
 // Copyright 2026 The LineageOS Project
 #pragma once
 #include "BcmFmProtocol.h"
+#include "RdsDecoder.h"
 #include <atomic>
 #include <mutex>
 
@@ -35,11 +36,21 @@ public:
     bool mute(bool muted);
     bool volume(int value);      // 0..255, receiver digital gain
     bool alive();
+    bool setRds(bool enabled);
+    int pollRds();
+    std::string programService();
+    std::string radioText();
+    // Probe at most two AFs, require stronger signal AND repeated matching PI,
+    // restore the original channel, then return a recommendation in kHz.
+    int activeAf();
 private:
     enum class Search { Found, BandLimit, Error, Cancelled, Timeout };
     bool write(uint8_t reg, int value, int width = 1);
     bool read(uint8_t reg, int width, int* value);
     bool down();
+    bool fifo(RdsDecoder& decoder);
+    bool resetRds();
+    int rssiMagnitude();
     Search search(int khz, bool seeking, bool up, uint64_t generation, int* found);
     bool tuneLocked(int khz, uint64_t generation);
     int seekLocked(int khz, bool up, bool wrap, uint64_t generation);
@@ -52,5 +63,9 @@ private:
     bool connected_ = false;
     bool muted_ = true;
     int frequency_ = kLowKHz;
+    bool rdsEnabled_ = false;
+    RdsDecoder rds_;
+    int64_t nextAfCheck_ = 0, nextAfAttempt_ = 0;
+    size_t afCursor_ = 0;
 };
 }  // namespace bcmfm

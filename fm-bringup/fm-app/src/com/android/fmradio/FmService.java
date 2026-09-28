@@ -72,6 +72,7 @@ import java.util.Iterator;
  */
 public class FmService extends Service implements FmRecorder.OnRecorderStateChangedListener {
     private boolean mBcmHci;
+    private volatile BcmFmCapture mBcmCapture;
     private BcmFmAudio mBcmAudio;
     private volatile boolean mDestroying;
     private volatile boolean mBcmStopRequested;
@@ -90,12 +91,63 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         @Override public void run() {
             if (mDestroying || mPowerStatus != POWER_UP) return;
             if (!FmNative.isBcmPowered()) {
-                mBcmAudio.stop();
+                stopBcmAudio();
                 bcmNotice(R.string.bcm_fm_failed);
                 powerDownAsync();
                 return;
             }
             mFmServiceHandler.postDelayed(this, 2000);
+        }
+    };
+
+    private void stopBcmAudio() {
+        BcmFmCapture capture = mBcmCapture;
+        if (capture != null) capture.stop();
+        mBcmAudio.stop();
+    }
+
+    private boolean bcmCanProbeAf() {
+        return !mDestroying && !mBcmStopRequested && !mBcmDucked && !mIsScanning && !mIsSeeking
+                && getRecorderState() != FmRecorder.STATE_RECORDING
+                && !mFmServiceHandler.hasMessages(FmListener.MSGID_TUNE_FINISHED)
+                && !mFmServiceHandler.hasMessages(FmListener.MSGID_SEEK_FINISHED)
+                && !mFmServiceHandler.hasMessages(FmListener.MSGID_SCAN_FINISHED)
+                && !mFmServiceHandler.hasMessages(FmListener.MSGID_STARTRECORDING_FINISHED)
+                && !mFmServiceHandler.hasMessages(FmListener.MSGID_POWERUP_FINISHED);
+    }
+
+    // BCM metadata runs on the same handler as tune/seek/scan, not on the legacy
+    // RDS thread. A metadata read cannot race a channel change or an AF probe.
+    private final Runnable mBcmRds = new Runnable() {
+        @Override public void run() {
+            if (mDestroying || mBcmStopRequested || mPowerStatus != POWER_UP) return;
+            int events = FmNative.readRds();
+            if (mDestroying || mBcmStopRequested) return;
+            ContentValues values = new ContentValues();
+            if ((events & RDS_EVENT_PROGRAMNAME) != 0) {
+                byte[] bytes = FmNative.getPs();
+                String ps = bytes == null ? "" : new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                setPs(ps);
+                values.put(Station.PROGRAM_SERVICE, ps);
+            }
+            if ((events & RDS_EVENT_LAST_RADIOTEXT) != 0) {
+                byte[] bytes = FmNative.getLrText();
+                String text = bytes == null ? "" : new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                setLRText(text);
+                values.put(Station.RADIO_TEXT, text);
+            }
+            if (values.size() > 0) {
+                if (FmStation.isStationExist(mContext, mCurrentStation))
+                    FmStation.updateStationToDb(mContext, mCurrentStation, values);
+                else {
+                    values.put(Station.FREQUENCY, mCurrentStation);
+                    FmStation.insertStationToDb(mContext, values);
+                }
+                updatePlayingNotification();
+            }
+            if ((events & RDS_EVENT_AF) != 0 && bcmCanProbeAf()) activeAf();
+            if (!mDestroying && !mBcmStopRequested)
+                mFmServiceHandler.postDelayed(this, 250);
         }
     };
 
@@ -284,7 +336,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
                             != AudioManager.SCO_AUDIO_STATE_DISCONNECTED;
                 if (unavailable) {
                     FmNative.stopScan();
-                    mBcmAudio.stop();
+                    stopBcmAudio();
                     powerDownAsync();
                 }
                 return;
@@ -716,7 +768,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         if (!FmNative.powerUp(frequency)) {
             mPowerStatus = POWER_DOWN;
             if (mBcmHci) {
-                mBcmAudio.stop();
+                stopBcmAudio();
                 abandonAudioFocus();
                 if (mWakeLock.isHeld()) mWakeLock.release();
                 bcmNotice(R.string.bcm_fm_failed);
@@ -776,7 +828,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         if (mBcmHci) {
             mBcmStopRequested = true;
             FmNative.stopScan();
-            mBcmAudio.stop();
+            stopBcmAudio();
         }
         // if power down Fm, should remove message first.
         // not remove all messages, because such as recorder message need
@@ -798,7 +850,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         if (mBcmHci) {
             mFmServiceHandler.removeCallbacks(mBcmHealth);
             FmNative.stopScan();
-            mBcmAudio.stop();
+            stopBcmAudio();
         }
         if (mPowerStatus == POWER_DOWN) {
             return true;
@@ -874,6 +926,8 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
                 mCurrentStation = FmUtils.computeStation(frequency);
                 FmStation.setCurrentStation(mContext, mCurrentStation);
                 updatePlayingNotification();
+            } else if (mBcmHci) {
+                setRds(true); // failed tune restored the old frequency
             }
             setMute(false);
             return bRet;
@@ -921,6 +975,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         setRds(false);
         mIsNativeSeeking = true;
         float fRet = FmNative.seek(frequency, isUp);
+        if (mBcmHci) setRds(true); // also restore RDS after no-station/cancellation
         mIsNativeSeeking = false;
         // make mIsStopScanCalled false, avoid stop scan make this true,
         // when start scan, it will return null.
@@ -1023,6 +1078,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
     }
 
     private int setRds(boolean on) {
+        if (mBcmHci) {
+            if (on && (mDestroying || mBcmStopRequested)) return -1;
+            if (!on) { setPs(""); setLRText(""); }
+        }
         if (mPowerStatus != POWER_UP) {
             return -1;
         }
@@ -1067,7 +1126,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
             return -1;
         }
 
+        if (mBcmHci && !bcmCanProbeAf()) return -1;
         int frequency = FmNative.activeAf();
+        if (mBcmHci && bcmCanProbeAf() && FmUtils.isValidStation(frequency)
+                && frequency != mCurrentStation) tuneStationAsync(FmUtils.computeFrequency(frequency));
         return frequency;
     }
 
@@ -1227,7 +1289,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
 
     private void startRecording() {
         if (mBcmHci) {
-            onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
+            startBcmRecording();
             return;
         }
         sRecordingSdcard = FmUtils.getDefaultStoragePath();
@@ -1254,6 +1316,47 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         }
     }
 
+    private void startBcmRecording() {
+        if (mDestroying || mBcmStopRequested || mBcmDucked || mPowerStatus != POWER_UP
+                || getRecorderState() == FmRecorder.STATE_RECORDING) return;
+        sRecordingSdcard = FmUtils.getDefaultStoragePath();
+        if (sRecordingSdcard == null || sRecordingSdcard.isEmpty() || !isSdcardReady(sRecordingSdcard)) {
+            onRecorderError(FmRecorder.ERROR_SDCARD_NOT_PRESENT);
+            return;
+        }
+        final BcmFmCapture capture = BcmFmCapture.open(mAudioManager);
+        if (capture == null) {
+            bcmNotice(R.string.bcm_fm_capture_failed);
+            onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
+            return;
+        }
+        if (mDestroying || mBcmStopRequested || mBcmDucked) { capture.stop(); return; }
+        mBcmCapture = capture;
+        // Preserve the standard AAC encoder, file naming, save/discard and media
+        // database integration. Only the source changes; never render capture PCM.
+        if (mFmRecorder == null) {
+            mFmRecorder = new FmRecorder(capture.format());
+            mFmRecorder.registerRecorderStateListener(FmService.this);
+        }
+        final FmRecorder recorder = mFmRecorder;
+        recorder.startRecording(mContext);
+        if (recorder.getState() != FmRecorder.STATE_RECORDING || !capture.start(new BcmFmCapture.Sink() {
+            @Override public void pcm(byte[] samples) { recorder.encode(samples); }
+            @Override public void failed() {
+                mFmServiceHandler.post(() -> {
+                    if (mBcmCapture != capture) return;
+                    stopRecording();
+                    bcmNotice(R.string.bcm_fm_capture_failed);
+                    onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
+                });
+            }
+        })) {
+            capture.stop();
+            mBcmCapture = null;
+            if (recorder.getState() == FmRecorder.STATE_RECORDING) stopRecording();
+        }
+    }
+
     private boolean isSdcardReady(String sdcardPath) {
         if (!mSdcardStateMap.isEmpty()) {
             if (mSdcardStateMap.get(sdcardPath) != null && !mSdcardStateMap.get(sdcardPath)) {
@@ -1273,6 +1376,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
     }
 
     private boolean stopRecording() {
+        if (mBcmHci && mBcmCapture != null) {
+            mBcmCapture.stop();
+            mBcmCapture = null;
+        }
         if (mFmRecorder == null) {
             Log.e(TAG, "stopRecording, called without a valid recorder!!");
             return false;
@@ -1592,7 +1699,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
         if (mBcmHci) {
             mFmServiceHandler.removeCallbacks(mBcmHealth);
             FmNative.stopScan();
-            mBcmAudio.stop();
+            stopBcmAudio();
         }
         mAudioManager.setParameters("AudioFmPreStop=1");
         setMute(true);
@@ -1669,6 +1776,11 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
      * Start RDS thread to update RDS information
      */
     private void startRdsThread() {
+        if (mBcmHci) {
+            mFmServiceHandler.removeCallbacks(mBcmRds);
+            mFmServiceHandler.postDelayed(mBcmRds, 250);
+            return;
+        }
         mIsRdsThreadExit = false;
         if (null != mRdsThread) {
             return;
@@ -1770,6 +1882,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
      * Stop RDS thread to stop listen station RDS change
      */
     private void stopRdsThread() {
+        if (mBcmHci) {
+            mFmServiceHandler.removeCallbacks(mBcmRds);
+            return;
+        }
         if (null != mRdsThread) {
             // Must call closedev after stopRDSThread.
             mIsRdsThreadExit = true;
@@ -1815,7 +1931,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
     private boolean enableFmAudio(boolean enable) {
         if (mBcmHci) {
             if (!enable) {
-                mBcmAudio.stop();
+                stopBcmAudio();
                 return true;
             }
             if (mDestroying || mBcmStopRequested || mPowerStatus != POWER_UP
@@ -1823,7 +1939,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
             if (mBcmDucked) return true; // keep tuner state, but no direct audio route
             boolean ok = mBcmAudio.start(mIsSpeakerUsed) && bcmVolume();
             if (!ok) {
-                mBcmAudio.stop();
+                stopBcmAudio();
                 bcmNotice(R.string.bcm_fm_failed);
                 powerDownAsync();
             }
@@ -1846,6 +1962,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
     }
 
     private void startPatchOrRender() {
+        if (mBcmHci) return;
         ArrayList<AudioPatch> patches = new ArrayList<AudioPatch>();
         mAudioManager.listAudioPatches(patches);
         if (mAudioPatch == null) {
@@ -2076,6 +2193,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
      */
     @Override
     public void onRecorderStateChanged(int state) {
+        if (mBcmHci && state != FmRecorder.STATE_RECORDING && mBcmCapture != null) {
+            mBcmCapture.stop();
+            mBcmCapture = null;
+        }
         mRecordState = state;
         Bundle bundle = new Bundle(2);
         bundle.putInt(FmListener.CALLBACK_FLAG, FmListener.LISTEN_RECORDSTATE_CHANGED);
@@ -2201,7 +2322,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
                         FmNative.stopScan();
                         // Stop the direct route now, before a worker blocked in
                         // seek has had time to process the focus-loss message.
-                        mBcmAudio.stop();
+                        stopBcmAudio();
                     }
                     switch (focusChange) {
                         case AudioManager.AUDIOFOCUS_LOSS:
@@ -2327,6 +2448,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
                 break;
 
             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                if (mBcmHci && getRecorderState() == FmRecorder.STATE_RECORDING) stopRecording();
                 setMute(true);
                 break;
 

@@ -19,7 +19,8 @@ struct FakeBus : Bus {
     int opens = 0, closes = 0, failAt = -1, wrongTune = 0, forcedSeek = 0;
     int flags = 0;
     std::vector<int> stations{88000, 94500, 101100, 108000};
-    std::map<int, int> registers;
+    std::map<int, int> registers, rssiByStation;
+    std::map<int, Bytes> rdsByStation;
     std::vector<Bytes> calls;
     std::function<void()> exchangeHook;
     bool open() override { ++opens; return opened = available; }
@@ -56,6 +57,15 @@ struct FakeBus : Bus {
                 }
             }
         } else {
+            if (reg == 0x80) {
+                const auto found = rdsByStation.find(registers[0x0a] + 64000);
+                const Bytes fifo = found == rdsByStation.end() ? Bytes{0x7c,0xff,0xff} : found->second;
+                result->insert(result->end(), fifo.begin(), fifo.end());
+                (*result)[1] = result->size() - 2;
+                return true;
+            }
+            if (reg == 0x0f && rssiByStation.count(registers[0x0a] + 64000))
+                registers[0x0f] = rssiByStation[registers[0x0a] + 64000];
             int value = reg == 0x12 ? (noCompletion ? 0 : flags) : registers[reg];
             if (reg == 0x12) flags = 0;
             result->push_back(value & 255);
@@ -75,6 +85,23 @@ struct Fixture {
     FakeBus bus;
     Radio radio{bus, clock};
 };
+Bytes stationRds(uint16_t pi) {
+    Bytes result;
+    for(int round=0;round<3;++round) for(int n=0;n<4;++n) {
+        const uint16_t af = n == 0 ? 0xe205 : (n == 1 ? 0x46cd : 0xcdcd);
+        Bytes group{0,uint8_t(pi>>8),uint8_t(pi),0x10,0,uint8_t(n),
+                    0x20,uint8_t(af>>8),uint8_t(af),0x30,'A','A'};
+        result.insert(result.end(),group.begin(),group.end());
+    }
+    return result;
+}
+void afSetup(Fixture& f, uint16_t candidatePi = 0x1234) {
+    assert(f.radio.powerUp(88000)); assert(f.radio.setRds(true)); assert(f.radio.mute(false));
+    f.bus.rdsByStation[88000] = stationRds(0x1234);
+    f.bus.rdsByStation[94500] = stationRds(candidatePi);
+    f.bus.rssiByStation = {{88000,18},{94500,38}}; // -110 dBm vs -90 dBm
+    assert(f.radio.pollRds() & RdsDecoder::kAf);
+}
 int main() {
     int tests = 0;
     auto test = [&](const char* name, const std::function<void()>& body) {
@@ -98,7 +125,7 @@ int main() {
         }
         for (Bytes bad : {Bytes{0x61, 0xfc, 5, 7, 0x19, 0x18, 0x19, 0x19},
                          Bytes{0x15, 0xfc, 4, 0xf8, 0, 0, 1},
-                         Bytes{0x15, 0xfc, 3, 0x00, 0, 3},
+                         Bytes{0x15, 0xfc, 3, 0x00, 0, 2},
                          Bytes{0x15, 0xfc, 3, 0x4d, 0, 0x80},
                          Bytes{0x15, 0xfc, 3, 0x80, 1, 128}})
             assert(!allowed(bad.data(), bad.size()));
@@ -241,6 +268,56 @@ int main() {
         Fixture f; assert(f.radio.powerUp(100000)); f.bus.available = false;
         assert(!f.radio.alive()); assert(!f.bus.opened);
         assert(!f.radio.tune(94500));
+    });
+    test("RDS enable, short FIFO, disable and channel reset", [] {
+        Fixture f; assert(f.radio.powerUp(88000)); assert(f.radio.setRds(true));
+        assert(f.bus.registers[0]==3 && f.bus.wrote(2,2) && f.bus.wrote(0x14,64));
+        f.bus.rdsByStation[88000]=stationRds(0x1234);
+        assert(f.radio.pollRds() & RdsDecoder::kPs);
+        assert(f.radio.programService()=="AAAAAAAA");
+        assert(f.radio.tune(94500));assert(f.radio.programService().empty());
+        assert(f.radio.pollRds()==0); // empty marker on another channel
+        assert(f.radio.setRds(false));assert(f.bus.registers[0]==1);
+        auto calls=f.bus.calls.size();assert(f.radio.pollRds()==0 && f.bus.calls.size()==calls);
+    });
+    test("each RDS initialization failure powers down", [] {
+        for(int stage=1;stage<=3;++stage) {
+            Fixture f;assert(f.radio.powerUp(88000));f.bus.failAt=f.bus.calls.size()+stage;
+            assert(!f.radio.setRds(true));assert(!f.bus.opened && f.bus.registers[0]==0);
+        }
+    });
+    test("RDS FIFO corruption and link loss fail closed", [] {
+        Fixture f;assert(f.radio.powerUp(88000));assert(f.radio.setRds(true));
+        f.bus.rdsByStation[88000]={0,1};assert(!f.radio.pollRds());assert(!f.bus.opened);
+        assert(f.radio.powerUp(88000));assert(f.radio.setRds(true));f.bus.available=false;
+        assert(!f.radio.pollRds());assert(!f.bus.opened);
+    });
+    test("AF recommends only stronger matching PI and restores channel/mute", [] {
+        Fixture f;afSetup(f);assert(f.radio.activeAf()==94500);
+        assert(f.bus.registers[0x0a]+64000==88000 && f.bus.registers[5]==0x2d);
+        assert(f.radio.programService()=="AAAAAAAA");
+        auto calls=f.bus.calls.size();assert(f.radio.activeAf()==-1 && f.bus.calls.size()==calls);
+    });
+    test("AF rejects different PI even with stronger signal", [] {
+        Fixture f;afSetup(f,0x9999);assert(f.radio.activeAf()==-1);
+        assert(f.bus.registers[0x0a]+64000==88000 && f.bus.registers[5]==0x2d);
+    });
+    test("AF hysteresis rejects a marginal candidate", [] {
+        Fixture f;afSetup(f);f.bus.rssiByStation[94500]=20;assert(f.radio.activeAf()==-1);
+        assert(f.bus.registers[0x0a]+64000==88000);
+    });
+    test("AF PI timeout is bounded and restores", [] {
+        Fixture f;afSetup(f);f.bus.rdsByStation.erase(94500);
+        auto start=f.clock.time;assert(f.radio.activeAf()==-1);assert(f.clock.time-start<=1280);
+        assert(f.bus.registers[0x0a]+64000==88000);
+    });
+    test("AF cancellation restores but never unmutes after focus loss", [] {
+        Fixture f;afSetup(f);
+        f.bus.exchangeHook=[&] {
+            if(f.bus.calls.back()[3]==0x80 && f.bus.registers[0x0a]+64000==94500)f.radio.cancel();
+        };
+        assert(f.radio.activeAf()==-1);
+        assert(f.bus.registers[0x0a]+64000==88000 && f.bus.registers[5]==0x2f);
     });
     std::cout << tests << " native tests passed\n";
 }

@@ -4,13 +4,21 @@ This is a **source-based integration candidate**, not a hardware-validated FM
 release. It uses the current A6 vendor repository at
 `f0c55d795a9be60147d76a42ec93fd9ba3e5800f` (`lineage-18.1`), the supplied stock dump,
 and the Broadcom FM register protocol. A stock log is useful but is **not required
-to build or try this candidate**. No vendor blobs or kernel files are changed.
+to build or try this candidate**. No vendor blobs or kernel files are changed. An A6 audio-policy copy attaches
+the existing FM capture input without changing other routes.
 The current vendor's `bcm4345C5_V0069.0172.hcd` is byte-identical to the dump
 (SHA-256 `fe5d61771d2e26310f295ee7241b5d188b80d80d3b6805f4a6452d52783a2225`).
 
 Apply the companion patches to **both** `system/bt` and `packages/apps/FMRadio`,
 then apply the device patches. Adding only `FMRadio` to PRODUCT_PACKAGES, or
 applying only this device patch, is not sufficient.
+
+## RDS and recording extension
+
+Device patch 0004 and companion patches 0002 implement RDS PS/RadioText/AF and
+FM-only recording. Read [fm-rds-recording.md](fm-rds-recording.md) for protocol,
+recording source checks, AF policy, reference sources and added tests. Earlier
+patch descriptions refer to the initial candidate, not the complete series.
 
 ## Source baselines
 
@@ -80,8 +88,9 @@ FMRadio -> AudioManager l_fmradio_mode -> Samsung SEC audio HAL
   Link health is checked while playing. Bluetooth shutdown, headset removal,
   focus loss and SCO audio activation stop the FM route; long scans are cancelled
   rather than leaving power-off queued behind a scan.
-* **RDS/AF and recording are disabled.** The backend reports RDS unsupported and
-  the recording actions are hidden/rejected. No fake station metadata is returned.
+* RDS PS (0A/0B), RadioText (2A/2B), PI-confirmed AF and FM-input-only recording
+  are implemented. Metadata comes from FIFO blocks, never fabricated values.
+  Recording refuses microphone fallback; neither FIFO nor capture is hardware-verified.
 * **No FM-to-A2DP/SCO playback**, no secondary-user support, and no automatic
   Bluetooth power management. Normal Bluetooth/Wi-Fi coexistence is a test item,
   not yet a verified claim.
@@ -166,10 +175,12 @@ python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt"
 python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt" --sanitize
 ```
 
-The native suite has 24 mock-controller test groups, including failure injection
-at every power-on I/O step. Six broker/socket test scenarios exercise exclusivity,
+The native suite has 32 mock-controller test groups, including failure injection
+at every power-on I/O step. Seven broker/socket test scenarios exercise exclusivity,
 peer rejection, bad requests, client death, timeouts, late callbacks, adapter
-restart/shutdown and callback ownership. The broker tests compile the real broker
+restart/shutdown, callback ownership and a maximum-size FIFO reply. There are
+also 16 RDS decoder groups, 8 Java capture-helper and 6 encoder lifecycle tests
+with mock Android audio/codec boundaries. The broker tests compile the real broker
 against **host mocks** for HCI/audio/peer credentials; they are not Android HAL or
 SELinux tests. ASan/UBSan passed in the development workspace.
 
