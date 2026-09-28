@@ -1,0 +1,4 @@
+# Platform-signed FMRadio shares android.uid.system (system_app). The endpoint
+# lives in Bluetooth's process and also checks UID plus a register allowlist.
+# Abstract socket: no filesystem socket, UART, radio device or vendor HAL grant.
+allow system_app bluetooth:unix_stream_socket connectto;

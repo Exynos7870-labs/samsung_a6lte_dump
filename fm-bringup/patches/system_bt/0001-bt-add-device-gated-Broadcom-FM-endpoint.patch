@@ -1,0 +1,430 @@
+From 76f21219436828f8dca17ec0112eea071160a186 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH] bt: add device-gated Broadcom FM endpoint
+
+Use Fluoride's existing HCI queue/credits rather than sharing the
+UART out of band. Authenticate UID 1000 and allow only the needed
+FM registers, never arbitrary VSCs or pin configuration.
+
+Bound transactions, handle late callbacks without request-owned
+pointers, and stop the session before HCI teardown. Attempt FM OFF
+and SEC audio route cleanup on client death. Other devices leave
+BRCM_FM_HCI_INCLUDED undefined and do not create the endpoint.
+
+Experimental A6 receive integration; not hardware validated.
+Base: bcca9a572f1cc539ba21ebe940c3642ce8707d1a
+---
+ btif/Android.bp              |   3 +
+ btif/include/BcmFmProtocol.h |  74 +++++++++++++
+ btif/include/btif_bcm_fm.h   |   8 ++
+ btif/src/btif_bcm_fm.cc      | 199 +++++++++++++++++++++++++++++++++++
+ btif/src/btif_core.cc        |   5 +
+ main/Android.bp              |   1 +
+ stack/Android.bp             |   1 +
+ test/headless/Android.bp     |   1 +
+ 8 files changed, 292 insertions(+)
+ create mode 100644 btif/include/BcmFmProtocol.h
+ create mode 100644 btif/include/btif_bcm_fm.h
+ create mode 100644 btif/src/btif_bcm_fm.cc
+
+diff --git a/btif/Android.bp b/btif/Android.bp
+index dd24121..c8094bf 100755
+--- a/btif/Android.bp
++++ b/btif/Android.bp
+@@ -58,6 +58,7 @@ cc_library_static {
+         "src/btif_config_cache.cc",
+         "src/btif_config_transcode.cc",
+         "src/btif_core.cc",
++        "src/btif_bcm_fm.cc",
+         "src/btif_debug.cc",
+         "src/btif_debug_btsnoop.cc",
+         "src/btif_debug_conn.cc",
+@@ -96,6 +97,7 @@ cc_library_static {
+     ],
+     shared_libs: [
+         "libaaudio",
++        "libaudioclient",
+         "libcutils",
+         "libfmq",
+         "liblog",
+@@ -132,6 +134,7 @@ cc_test {
+     header_libs: ["libbluetooth_headers"],
+     shared_libs: [
+         "libaaudio",
++        "libaudioclient",
+         "android.hardware.bluetooth@1.0",
+         "android.hardware.bluetooth.a2dp@1.0",
+         "android.hardware.bluetooth.audio@2.0",
+diff --git a/btif/include/BcmFmProtocol.h b/btif/include/BcmFmProtocol.h
+new file mode 100644
+index 0000000..f5c8e3b
+--- /dev/null
++++ b/btif/include/BcmFmProtocol.h
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace bcmfm {
++// Abstract AF_UNIX/SOCK_SEQPACKET socket. HCI command/event bytes, no H4 prefix.
++constexpr char kSocket[] = "a6lte.bcm_fm.v1";
++constexpr uint32_t kClientUid = 1000;     // platform FMRadio's android.uid.system
++constexpr uint32_t kServerUid = 1002;     // Bluetooth app, NOT the vendor HAL
++constexpr size_t kMaxEvent = 257;
++constexpr int kLowKHz = 87500;
++constexpr int kHighKHz = 108000;
++constexpr int kStepKHz = 100;
++inline bool validFrequency(int khz) {
++    return khz >= kLowKHz && khz <= kHighKHz && khz % kStepKHz == 0;
++}
++inline uint16_t le16(const uint8_t* p) { return p[0] | (uint16_t(p[1]) << 8); }
++
++// Defence in depth: no generic HCI access, pin mux, RAM, firmware or RDS FIFO
++// operations. Match every request length and value before it enters Fluoride.
++inline bool allowed(const uint8_t* p, size_t n) {
++    if (n < 6 || n > 7 || p[0] != 0x15 || p[1] != 0xfc || p[2] != n - 3)
++        return false;
++    const uint8_t reg = p[3], access = p[4];
++    if (access == 1) {
++        if (n != 6) return false;
++        switch (reg) {
++            case 0x00: case 0x01: case 0x0f: case 0x4d: case 0xdf:
++                return p[5] == 1;
++            case 0x05: case 0x0a: case 0x12:
++                return p[5] == 2;
++            default: return false;
++        }
++    }
++    if (access != 0) return false;
++    if (n == 6) {
++        switch (reg) {
++            case 0x00: return p[5] <= 1;       // FM off/on, no RDS yet
++            case 0x01: return p[5] == 0x02;    // west band, auto stereo
++            case 0x07: return p[5] == 105 || p[5] == (105 | 0x80);
++            case 0x08: return p[5] == 10;      // stock SNR threshold
++            case 0x09: return p[5] <= 2;       // cancel, preset, seek
++            case 0xfc: case 0xfe: return p[5] == 0;
++            case 0xfd: return p[5] == 1;       // 100 kHz
++            default: return false;
++        }
++    }
++    const uint16_t value = le16(p + 5);
++    switch (reg) {
++        case 0x05: return value == 0x2d || value == 0x2f; // I2S, 50us, mute bit
++        case 0x0a: return validFrequency(value + 64000);
++        case 0x10: return value == 0;           // poll flags; no async interrupts
++        case 0xf8: return value <= 255;
++        default: return false;
++    }
++}
++
++// Require the register/access echo; do not guess around incompatible firmware.
++inline bool response(const std::vector<uint8_t>& request,
++                     const std::vector<uint8_t>& event, std::vector<uint8_t>* data) {
++    if (!allowed(request.data(), request.size()) || event.size() < 8 ||
++        event[0] != 0x0e || event[1] != event.size() - 2 ||
++        event[3] != 0x15 || event[4] != 0xfc || event[5] != 0 ||
++        event[6] != request[3] || event[7] != request[4]) return false;
++    const size_t expected = request[4] == 1 ? request[5] : 0;
++    if (event.size() != 8 + expected) return false;
++    data->assign(event.begin() + 8, event.end());
++    return true;
++}
++}  // namespace bcmfm
+diff --git a/btif/include/btif_bcm_fm.h b/btif/include/btif_bcm_fm.h
+new file mode 100644
+index 0000000..485c5c8
+--- /dev/null
++++ b/btif/include/btif_bcm_fm.h
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#pragma once
++
++// Called by the adapter lifecycle, after HCI startup and before HCI shutdown.
++// No-ops unless BRCM_FM_HCI_INCLUDED is enabled in bdroid_buildcfg.h.
++void btif_bcm_fm_start();
++void btif_bcm_fm_stop();
+diff --git a/btif/src/btif_bcm_fm.cc b/btif/src/btif_bcm_fm.cc
+new file mode 100644
+index 0000000..994ffd8
+--- /dev/null
++++ b/btif/src/btif_bcm_fm.cc
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#define LOG_TAG "bt_bcm_fm"
++#include "bt_target.h"
++#include "btif_bcm_fm.h"
++
++#if defined(BRCM_FM_HCI_INCLUDED) && (BRCM_FM_HCI_INCLUDED == TRUE)
++#include "BcmFmProtocol.h"
++#include "hci_layer.h"
++#include "osi/include/allocator.h"
++#include "osi/include/log.h"
++#include <media/AudioSystem.h>
++#include <utils/String8.h>
++
++#include <cerrno>
++#include <chrono>
++#include <condition_variable>
++#include <cstring>
++#include <mutex>
++#include <poll.h>
++#include <sys/eventfd.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++namespace {
++using Bytes = std::vector<uint8_t>;
++std::mutex lifecycle;
++struct State {
++    std::mutex mutex;
++    std::condition_variable ready;
++    bool running = false;
++    bool healthy = true;
++    bool pending = false;
++    uintptr_t serial = 0;  // never reset between adapter lifetimes
++    Bytes reply;
++    int listener = -1;
++    int wake = -1;
++    std::thread worker;
++} state;
++
++void deliver(void* token, Bytes reply) {
++    std::lock_guard<std::mutex> lock(state.mutex);
++    // No request-owned pointer: late callbacks after timeout/shutdown cannot
++    // dereference freed memory or complete a newer adapter/session's request.
++    if (state.pending && state.serial == reinterpret_cast<uintptr_t>(token)) {
++        state.reply = std::move(reply);
++        state.pending = false;
++        state.ready.notify_all();
++    }
++}
++void complete(BT_HDR* packet, void* token) {
++    Bytes bytes;
++    if (packet->len <= bcmfm::kMaxEvent) {
++        const uint8_t* data = packet->data + packet->offset;
++        bytes.assign(data, data + packet->len);
++    }
++    osi_free(packet);  // HCI gives ownership of Command Complete to the callback
++    deliver(token, std::move(bytes));
++}
++void status(uint8_t code, BT_HDR* command, void* token) {
++    // Register VSCs must complete, not merely be accepted for async execution.
++    LOG_ERROR(LOG_TAG, "FM VSC returned Command Status 0x%02x", code);
++    osi_free(command);  // ownership specified by hci_layer.h/filter_incoming_event
++    deliver(token, {});
++}
++
++bool exchange(const Bytes& request, Bytes* reply) {
++    std::unique_lock<std::mutex> lock(state.mutex);
++    if (!state.running || !state.healthy) return false;
++    const hci_t* hci = hci_layer_get_interface();
++    if (!hci || !hci->transmit_command) return false;
++    state.pending = true;
++    state.reply.clear();
++    if (++state.serial == 0) ++state.serial;
++    BT_HDR* command = static_cast<BT_HDR*>(osi_calloc(sizeof(BT_HDR) + request.size()));
++    command->len = static_cast<uint16_t>(request.size());
++    memcpy(command->data, request.data(), request.size());
++    // transmit_command enqueues asynchronously and preserves HCI command credits
++    // and event ownership. Never send via the vendor HAL or UART in parallel.
++    hci->transmit_command(command, complete, status, reinterpret_cast<void*>(state.serial));
++    if (!state.ready.wait_for(lock, std::chrono::milliseconds(1500), [] {
++            return !state.pending || !state.running;
++        }) || !state.running || state.reply.empty()) {
++        state.pending = false;
++        state.healthy = false;  // don't retry queued commands on an ambiguous link
++        LOG_ERROR(LOG_TAG, "FM transport unavailable/timed out; toggle Bluetooth to recover");
++        return false;
++    }
++    *reply = std::move(state.reply);
++    return true;
++}
++
++void cleanup_session() {
++    Bytes ignored;
++    // Client death must not leave the receiver running. On adapter shutdown the
++    // controller will be powered down; exchange() then deliberately refuses work.
++    exchange({0x15, 0xfc, 3, 0x00, 0x00, 0x00}, &ignored);
++    // FMRadio uses direct SEC-HAL playback, not a software loopback. Reset it on
++    // client death too, after AudioFlinger has lost the app's keep-alive track.
++    android::AudioSystem::setParameters(0, android::String8("l_fmradio_mode=off"));
++}
++
++void serve() {
++    int client = -1;
++    while (true) {
++        pollfd fds[] = {{state.wake, POLLIN, 0}, {state.listener, POLLIN, 0},
++                        {client, POLLIN, 0}};
++        int result;
++        do { result = poll(fds, 3, -1); } while (result < 0 && errno == EINTR);
++        if (result < 0 || fds[0].revents) break;
++        if (fds[1].revents & POLLIN) {
++            int fd = accept4(state.listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
++            if (fd >= 0) {
++                ucred peer{};
++                socklen_t length = sizeof(peer);
++                if (client >= 0 || getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &length) != 0 ||
++                    length != sizeof(peer) || peer.uid != bcmfm::kClientUid) {
++                    close(fd);
++                } else {
++                    client = fd;
++                }
++            }
++        }
++        if (fds[2].revents && client >= 0) {
++            uint8_t buffer[16];
++            ssize_t n = recv(client, buffer, sizeof(buffer), MSG_TRUNC | MSG_DONTWAIT);
++            if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
++            Bytes reply;
++            bool ok = n > 0 && static_cast<size_t>(n) <= sizeof(buffer) &&
++                      bcmfm::allowed(buffer, n) && exchange(Bytes(buffer, buffer + n), &reply);
++            if (ok) {
++                ok = send(client, reply.data(), reply.size(), MSG_NOSIGNAL) ==
++                     static_cast<ssize_t>(reply.size());
++            }
++            if (!ok) {
++                close(client);
++                client = -1;
++                cleanup_session();
++            }
++        }
++    }
++    if (client >= 0) {
++        close(client);
++        cleanup_session();
++    }
++}
++}  // namespace
++
++void btif_bcm_fm_start() {
++    std::lock_guard<std::mutex> life(lifecycle);
++    if (state.worker.joinable()) return;
++    int listener = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++    int wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++    sockaddr_un address{};
++    address.sun_family = AF_UNIX;
++    memcpy(address.sun_path + 1, bcmfm::kSocket, sizeof(bcmfm::kSocket) - 1);
++    const socklen_t length = offsetof(sockaddr_un, sun_path) + sizeof(bcmfm::kSocket);
++    if (listener < 0 || wake < 0 || bind(listener, reinterpret_cast<sockaddr*>(&address), length) != 0 ||
++        listen(listener, 1) != 0) {
++        LOG_ERROR(LOG_TAG, "Cannot start FM endpoint: %s", strerror(errno));
++        if (listener >= 0) close(listener);
++        if (wake >= 0) close(wake);
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lock(state.mutex);
++        state.listener = listener;
++        state.wake = wake;
++        state.running = state.healthy = true;
++        state.pending = false;
++    }
++    state.worker = std::thread(serve);
++    LOG_INFO(LOG_TAG, "A6 experimental Broadcom FM endpoint started");
++}
++
++void btif_bcm_fm_stop() {
++    std::lock_guard<std::mutex> life(lifecycle);
++    if (!state.worker.joinable()) return;
++    {
++        std::lock_guard<std::mutex> lock(state.mutex);
++        state.running = false;
++        state.pending = false;
++        state.ready.notify_all();
++    }
++    uint64_t value = 1;
++    ssize_t written;
++    do { written = write(state.wake, &value, sizeof(value)); } while (written < 0 && errno == EINTR);
++    state.worker.join();
++    close(state.listener);
++    close(state.wake);
++    state.listener = state.wake = -1;
++}
++#else
++void btif_bcm_fm_start() {}
++void btif_bcm_fm_stop() {}
++#endif
+diff --git a/btif/src/btif_core.cc b/btif/src/btif_core.cc
+index aa77979..ecdb386 100644
+--- a/btif/src/btif_core.cc
++++ b/btif/src/btif_core.cc
+@@ -48,6 +48,7 @@
+ #include "bta_api.h"
+ #include "bte.h"
+ #include "btif_api.h"
++#include "btif_bcm_fm.h"
+ #include "btif_av.h"
+ #include "btif_config.h"
+ #include "btif_pan.h"
+@@ -382,6 +383,8 @@ void btif_enable_bluetooth_evt(tBTA_STATUS status) {
+     /* init pan */
+     btif_pan_init();
+ 
++    btif_bcm_fm_start();
++
+     /* load did configuration */
+     bte_load_did_conf(BTE_DID_CONF_FILE);
+ 
+@@ -414,6 +417,7 @@ void btif_enable_bluetooth_evt(tBTA_STATUS status) {
+  *
+  ******************************************************************************/
+ bt_status_t btif_disable_bluetooth() {
++  btif_bcm_fm_stop();
+   LOG_INFO(LOG_TAG, "%s entered", __func__);
+ 
+   do_in_main_thread(FROM_HERE, base::Bind(&btm_ble_multi_adv_cleanup));
+@@ -465,6 +469,7 @@ void btif_disable_bluetooth_evt() {
+  ******************************************************************************/
+ 
+ bt_status_t btif_cleanup_bluetooth() {
++  btif_bcm_fm_stop();
+   LOG_INFO(LOG_TAG, "%s entered", __func__);
+   do_in_main_thread(FROM_HERE, base::Bind(&BTA_VendorCleanup));
+   btif_dm_cleanup();
+diff --git a/main/Android.bp b/main/Android.bp
+index 90490ef..9c5a0b2 100644
+--- a/main/Android.bp
++++ b/main/Android.bp
+@@ -84,6 +84,7 @@ cc_library_shared {
+         "android.hardware.bluetooth.a2dp@1.0",
+         "android.hardware.bluetooth.audio@2.0",
+         "libaaudio",
++        "libaudioclient",
+         "libcutils",
+         "libdl",
+         "libfmq",
+diff --git a/stack/Android.bp b/stack/Android.bp
+index 580e0f9..0116fd8 100644
+--- a/stack/Android.bp
++++ b/stack/Android.bp
+@@ -207,6 +207,7 @@ cc_test {
+         "android.hardware.bluetooth.a2dp@1.0",
+         "android.hardware.bluetooth.audio@2.0",
+         "libaaudio",
++        "libaudioclient",
+         "libcutils",
+         "libdl",
+         "libfmq",
+diff --git a/test/headless/Android.bp b/test/headless/Android.bp
+index fbfb2f4..d91d210 100644
+--- a/test/headless/Android.bp
++++ b/test/headless/Android.bp
+@@ -46,6 +46,7 @@ cc_test {
+         "android.hardware.bluetooth@1.0",
+         "android.hardware.bluetooth@1.1",
+         "libaaudio",
++        "libaudioclient",
+         "libbase",
+         "libcrypto",
+         "libcutils",  // property_get_bool

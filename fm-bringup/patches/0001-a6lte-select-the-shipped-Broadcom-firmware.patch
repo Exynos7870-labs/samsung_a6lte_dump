@@ -1,0 +1,27 @@
+From e85cd20d2354f7c621e050762b512d830757c4d5 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH 1/2] a6lte: select the shipped Broadcom firmware
+
+The A6 Q blob list and stock A600FNXXU9CVB1 dump provide
+bcm4345C5_V0069.0172.hcd, not bcm43455.hcd. Select the
+existing firmware file explicitly. No firmware bytes are changed.
+
+This corrects a prerequisite for Bluetooth/FM bring-up; it does
+not implement or validate FM support.
+
+Target: samsungexynos7870/android_device_samsung_a6lte lineage-18.1
+Base: a6b97426994a2d03df18087ed8b8c4c84a69905c
+---
+ bluetooth/bt_vendor.conf | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/bluetooth/bt_vendor.conf b/bluetooth/bt_vendor.conf
+index 98ed739..bc75bac 100644
+--- a/bluetooth/bt_vendor.conf
++++ b/bluetooth/bt_vendor.conf
+@@ -1,2 +1,2 @@
+-# Firmware patch file name
+-FwPatchFileName = bcm43455.hcd
++# Firmware patch file name (matches vendor-tools/proprietary-files_a6lte_q.txt)
++FwPatchFileName = bcm4345C5_V0069.0172.hcd

@@ -1,0 +1,50 @@
+[
+  {
+    "repository": "samsungexynos7870/android_device_samsung_a6lte",
+    "revision": "lineage-18.1",
+    "commit": "a6b97426994a2d03df18087ed8b8c4c84a69905c",
+    "path": "device/samsung/a6lte"
+  },
+  {
+    "repository": "samsungexynos7870/android_device_samsung_universal7870-common",
+    "revision": "lineage-18.1-oss_bsp-vndk",
+    "commit": "a433c37b08659956b366e06019c36e310a0b2781",
+    "path": "device/samsung/universal7870-common"
+  },
+  {
+    "repository": "samsungexynos7870/android_kernel_samsung_exynos7870",
+    "revision": "lineage-18.1-lts",
+    "commit": "e41078f882271fe43089a683a200bdab8803483b",
+    "path": "kernel/samsung/exynos7870"
+  },
+  {
+    "repository": "samsungexynos7870/android_vendor_samsung_a6lte",
+    "revision": "lineage-18.1",
+    "commit": "f0c55d795a9be60147d76a42ec93fd9ba3e5800f",
+    "path": "vendor/samsung/a6lte"
+  },
+  {
+    "repository": "samsungexynos7870/android_vendor_samsung_universal7870-common",
+    "revision": "lineage-18.1-lts",
+    "commit": "5c77cae3529a5ca03f12a5988a7cb0247bbced96",
+    "path": "vendor/samsung/universal7870-common"
+  },
+  {
+    "repository": "samsungexynos7870/android_hardware_samsung",
+    "revision": "lineage-18.1",
+    "commit": "58b54611926a37d4bbbebf259d3ea3e627a50fee",
+    "path": "hardware/samsung"
+  },
+  {
+    "repository": "LineageOS/android_system_bt",
+    "revision": "lineage-18.1",
+    "commit": "bcca9a572f1cc539ba21ebe940c3642ce8707d1a",
+    "path": "system/bt"
+  },
+  {
+    "repository": "LineageOS/android_packages_apps_FMRadio",
+    "revision": "lineage-18.1",
+    "commit": "c8664126026de37a442dba996db8bc4d3606dc41",
+    "path": "packages/apps/FMRadio"
+  }
+]
