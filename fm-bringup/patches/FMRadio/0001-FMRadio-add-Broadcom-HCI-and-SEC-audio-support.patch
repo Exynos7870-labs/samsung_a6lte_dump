@@ -1,0 +1,664 @@
+From e277517a851572f2b330106eadabc14bfe79f499 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH] FMRadio: add Broadcom HCI and SEC audio support
+
+Select a separate JNI soname and opt-in device resource. Require
+Bluetooth enabled and a wired antenna; follow adapter/SCO/focus
+lifecycle, bound cancellation and monitor link health. Route through
+the Samsung SEC HAL rather than software-looping direct FM audio.
+
+Use per-track output selection and receiver digital volume. Keep
+RDS/AF unsupported and recording UI disabled for this candidate.
+Legacy devices keep the existing libfmjni and audio path.
+
+Experimental: exact firmware response and audio route need phone
+validation; a stock log is not required to build this candidate.
+Base: c8664126026de37a442dba996db8bc4d3606dc41
+---
+ Android.mk                                  |   4 +
+ res/values/bcm_fm_strings.xml               |   6 +
+ res/values/config.xml                       |   2 +
+ src/com/android/fmradio/BcmFmAudio.java     | 105 +++++++++++
+ src/com/android/fmradio/FmMainActivity.java |   4 +
+ src/com/android/fmradio/FmNative.java       |  14 +-
+ src/com/android/fmradio/FmService.java      | 185 +++++++++++++++++++-
+ 7 files changed, 309 insertions(+), 11 deletions(-)
+ create mode 100644 res/values/bcm_fm_strings.xml
+ create mode 100644 src/com/android/fmradio/BcmFmAudio.java
+
+diff --git a/Android.mk b/Android.mk
+index 86b479b..b359481 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -31,7 +31,11 @@ LOCAL_PACKAGE_NAME := FMRadio
+ 
+ LOCAL_PRIVATE_PLATFORM_APIS := true
+ 
++ifeq ($(BOARD_HAVE_BCM_FM_HCI),true)
++LOCAL_JNI_SHARED_LIBRARIES := libfmjni_bcm_hci
++else
+ LOCAL_JNI_SHARED_LIBRARIES := libfmjni
++endif
+ 
+ LOCAL_PROGUARD_ENABLED := disabled
+ LOCAL_PRIVILEGED_MODULE := true
+diff --git a/res/values/bcm_fm_strings.xml b/res/values/bcm_fm_strings.xml
+new file mode 100644
+index 0000000..980f6da
+--- /dev/null
++++ b/res/values/bcm_fm_strings.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<resources>
++    <string name="bcm_fm_enable_bluetooth">Enable Bluetooth before using FM radio. Wired headphones are required as the antenna.</string>
++    <string name="bcm_fm_failed">FM radio is unavailable. This experimental backend needs device testing; check the BcmFm and bt_bcm_fm logs.</string>
++</resources>
+diff --git a/res/values/config.xml b/res/values/config.xml
+index b587355..06eb85b 100644
+--- a/res/values/config.xml
++++ b/res/values/config.xml
+@@ -16,4 +16,6 @@
+ 
+ <resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+     <bool name="config_useSoftwareRenderingForAudio" translatable="false">true</bool>
++    <!-- Device opt-in. Requires the BCM HCI JNI backend and Bluetooth patch. -->
++    <bool name="config_bcmHciFm" translatable="false">false</bool>
+ </resources>
+diff --git a/src/com/android/fmradio/BcmFmAudio.java b/src/com/android/fmradio/BcmFmAudio.java
+new file mode 100644
+index 0000000..3c87059
+--- /dev/null
++++ b/src/com/android/fmradio/BcmFmAudio.java
+@@ -0,0 +1,105 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright 2026 The LineageOS Project
++ */
++package com.android.fmradio;
++
++import android.media.AudioAttributes;
++import android.media.AudioDeviceInfo;
++import android.media.AudioFormat;
++import android.media.AudioManager;
++import android.media.AudioTrack;
++import android.util.Log;
++
++/** Experimental SEC HAL direct-FM route; no raw mixer or PCM device access. */
++final class BcmFmAudio {
++    private static final String TAG = "BcmFmAudio";
++    private final AudioManager mManager;
++    private AudioTrack mTrack;
++    private boolean mSpeaker;
++
++    BcmFmAudio(AudioManager manager) {
++        mManager = manager;
++        // Also recover the HAL route after a previous app process died.
++        mManager.setParameters("l_fmradio_mode=off");
++    }
++
++    private AudioDeviceInfo output(boolean speaker) {
++        for (AudioDeviceInfo device : mManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
++            int type = device.getType();
++            if ((speaker && type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
++                    || (!speaker && (type == AudioDeviceInfo.TYPE_WIRED_HEADSET
++                    || type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES))) {
++                return device;
++            }
++        }
++        return null;
++    }
++
++    synchronized boolean start(boolean speaker) {
++        if (mTrack != null) return selectSpeaker(speaker);
++        if (mManager.getMode() != AudioManager.MODE_NORMAL || mManager.isBluetoothScoOn()) {
++            return false;
++        }
++        AudioDeviceInfo device = output(speaker);
++        if (device == null) return false;
++        try {
++            mManager.setParameters("l_fmradio_mode=ready");
++            // Keep a primary MUSIC output active so the SEC HAL selects the FM
++            // mixer route. The real audio comes from the combo chip via FM DAI 4,
++            // not from these zero samples. Do not software-loop FM on top of it.
++            mTrack = new AudioTrack.Builder()
++                    .setAudioAttributes(new AudioAttributes.Builder()
++                            .setUsage(AudioAttributes.USAGE_MEDIA)
++                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
++                    .setAudioFormat(new AudioFormat.Builder().setSampleRate(48000)
++                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
++                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
++                    .setTransferMode(AudioTrack.MODE_STATIC)
++                    .setBufferSizeInBytes(19200).build();
++            if (mTrack.getState() == AudioTrack.STATE_UNINITIALIZED
++                    || !mTrack.setPreferredDevice(device)) throw new IllegalStateException("no FM output");
++            byte[] silence = new byte[19200];
++            if (mTrack.write(silence, 0, silence.length) != silence.length
++                    || mTrack.setLoopPoints(0, silence.length / 4, -1) != AudioTrack.SUCCESS) {
++                throw new IllegalStateException("cannot initialize FM keep-alive track");
++            }
++            mSpeaker = speaker;
++            mTrack.play();
++            mManager.setParameters("l_fmradio_mode=on");
++            return true;
++        } catch (IllegalArgumentException | IllegalStateException error) {
++            Log.e(TAG, "FM audio start failed", error);
++            stop();
++            return false;
++        }
++    }
++
++    synchronized boolean selectSpeaker(boolean speaker) {
++        mSpeaker = speaker;
++        if (mTrack == null) return true;
++        AudioDeviceInfo device = output(speaker);
++        return device != null && mTrack.setPreferredDevice(device);
++    }
++
++    synchronized int digitalVolume() {
++        int index = mManager.getStreamVolume(AudioManager.STREAM_MUSIC);
++        if (index == 0 || mManager.isStreamMute(AudioManager.STREAM_MUSIC)) return 0;
++        int type = mSpeaker ? AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
++                : AudioDeviceInfo.TYPE_WIRED_HEADPHONES;
++        float db = mManager.getStreamVolumeDb(AudioManager.STREAM_MUSIC, index, type);
++        // Direct HAL FM playback bypasses AudioTrack's sample-volume scaling.
++        // Follow the MUSIC attenuation curve in the receiver rather than playing
++        // full-volume radio while changing only the gain of the silence track.
++        return Math.max(0, Math.min(255, Math.round(255.0f * (float) Math.pow(10.0, db / 20.0))));
++    }
++
++    synchronized void stop() {
++        // Turn off the SEC route before releasing the track/going into standby.
++        mManager.setParameters("l_fmradio_mode=off");
++        if (mTrack != null) {
++            try { mTrack.stop(); } catch (IllegalStateException ignored) { }
++            mTrack.release();
++            mTrack = null;
++        }
++    }
++}
+diff --git a/src/com/android/fmradio/FmMainActivity.java b/src/com/android/fmradio/FmMainActivity.java
+index 82db51b..e72a855 100644
+--- a/src/com/android/fmradio/FmMainActivity.java
++++ b/src/com/android/fmradio/FmMainActivity.java
+@@ -741,6 +741,10 @@ public class FmMainActivity extends Activity implements FmFavoriteEditDialog.Edi
+     public boolean onCreateOptionsMenu(Menu menu) {
+         MenuInflater inflater = getMenuInflater();
+         inflater.inflate(R.menu.fm_action_bar, menu);
++        if (getResources().getBoolean(R.bool.config_bcmHciFm)) {
++            menu.findItem(R.id.fm_start_record).setVisible(false);
++            menu.findItem(R.id.fm_record_list).setVisible(false);
++        }
+         mMenuItemStationlList = menu.findItem(R.id.fm_station_list);
+         mMenuItemHeadset = menu.findItem(R.id.fm_headset);
+         mMenuItemStartRecord = menu.findItem(R.id.fm_start_record);
+diff --git a/src/com/android/fmradio/FmNative.java b/src/com/android/fmradio/FmNative.java
+index da8cbce..27d5913 100644
+--- a/src/com/android/fmradio/FmNative.java
++++ b/src/com/android/fmradio/FmNative.java
+@@ -20,10 +20,20 @@ package com.android.fmradio;
+  * This class define FM native interface, will description FM native interface
+  */
+ public class FmNative {
+-    static {
+-        System.loadLibrary("fmjni");
++    private static boolean sLoaded;
++
++    static synchronized void init(boolean bcmHci) {
++        if (!sLoaded) {
++            System.loadLibrary(bcmHci ? "fmjni_bcm_hci" : "fmjni");
++            sLoaded = true;
++        }
+     }
+ 
++    // Only called on the opt-in HCI backend; legacy JNI implementations don't
++    // have to export these entry points.
++    static native boolean setBcmVolume(int volume);
++    static native boolean isBcmPowered();
++
+     /**
+      * Open FM device, call before power up
+      *
+diff --git a/src/com/android/fmradio/FmService.java b/src/com/android/fmradio/FmService.java
+index 3323fb0..d1a05ac 100644
+--- a/src/com/android/fmradio/FmService.java
++++ b/src/com/android/fmradio/FmService.java
+@@ -71,6 +71,34 @@ import java.util.Iterator;
+  * Background service to control FM or do background tasks.
+  */
+ public class FmService extends Service implements FmRecorder.OnRecorderStateChangedListener {
++    private boolean mBcmHci;
++    private BcmFmAudio mBcmAudio;
++    private volatile boolean mDestroying;
++    private volatile boolean mBcmStopRequested;
++    private volatile boolean mBcmDucked;
++
++    private void bcmNotice(int message) {
++        new Handler(Looper.getMainLooper()).post(() ->
++                android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show());
++    }
++
++    private boolean bcmVolume() {
++        return !mBcmHci || FmNative.setBcmVolume(mBcmAudio.digitalVolume());
++    }
++
++    private final Runnable mBcmHealth = new Runnable() {
++        @Override public void run() {
++            if (mDestroying || mPowerStatus != POWER_UP) return;
++            if (!FmNative.isBcmPowered()) {
++                mBcmAudio.stop();
++                bcmNotice(R.string.bcm_fm_failed);
++                powerDownAsync();
++                return;
++            }
++            mFmServiceHandler.postDelayed(this, 2000);
++        }
++    };
++
+     // Logging
+     private static final String TAG = "FmService";
+ 
+@@ -247,6 +275,26 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+             String action = intent.getAction();
+             String command = intent.getStringExtra("command");
+             Log.d(TAG, "onReceive, action = " + action + " / command = " + command);
++            if (mBcmHci && (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)
++                    || AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED.equals(action))) {
++                boolean unavailable = BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)
++                        ? intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
++                            != BluetoothAdapter.STATE_ON
++                        : intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1)
++                            != AudioManager.SCO_AUDIO_STATE_DISCONNECTED;
++                if (unavailable) {
++                    FmNative.stopScan();
++                    mBcmAudio.stop();
++                    powerDownAsync();
++                }
++                return;
++            }
++            if (mBcmHci && "android.media.VOLUME_CHANGED_ACTION".equals(action)) {
++                mFmServiceHandler.post(() -> {
++                    if (mPowerStatus == POWER_UP && !bcmVolume()) powerDownAsync();
++                });
++                return;
++            }
+             // other app want FM stop, stop FM
+ 
+             if (CMDPAUSE.equals(command)) {
+@@ -368,7 +416,14 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+ 
+     private void setForceUse(boolean isSpeaker) {
+         mForcedUseForMedia = isSpeaker ? AudioSystem.FORCE_SPEAKER : AudioSystem.FORCE_NONE;
+-        AudioSystem.setForceUse(FOR_PROPRIETARY, mForcedUseForMedia);
++        if (mBcmHci) {
++            if (!mBcmAudio.selectSpeaker(isSpeaker)) powerDownAsync();
++            mFmServiceHandler.post(() -> {
++                if (mPowerStatus == POWER_UP && !bcmVolume()) powerDownAsync();
++            });
++        } else {
++            AudioSystem.setForceUse(FOR_PROPRIETARY, mForcedUseForMedia);
++        }
+         mIsSpeakerUsed = isSpeaker;
+     }
+ 
+@@ -394,6 +449,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private synchronized void startRender() {
++        if (mBcmHci) return;
+         Log.d(TAG, "startRender " + AudioSystem.getForceUse(FOR_PROPRIETARY));
+ 
+         exitRenderThread();
+@@ -420,6 +476,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private synchronized void stopRender() {
++        if (mBcmHci) return;
+         Log.d(TAG, "stopRender");
+         mIsRender = false;
+         // HACK: Set volume to 0 to squelch any output between the call to
+@@ -428,6 +485,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private synchronized void createRenderThread() {
++        if (mBcmHci) return;
+         if (mRenderThread == null) {
+             mRenderThread = new RenderThread();
+             mRenderThread.start();
+@@ -435,6 +493,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private synchronized void exitRenderThread() {
++        if (mRenderThread == null) return;
+         mRenderThread.interrupt();
+         try {
+             mRenderThread.join();
+@@ -462,6 +521,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private void startAudioTrack() {
++        if (mBcmHci) return;
+         if (mAudioTrack.getPlayState() == AudioTrack.PLAYSTATE_STOPPED) {
+             ArrayList<AudioPatch> patches = new ArrayList<AudioPatch>();
+             mAudioManager.listAudioPatches(patches);
+@@ -470,6 +530,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private void stopAudioTrack() {
++        if (mBcmHci) return;
+         if (mAudioTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+             mAudioTrack.stop();
+         }
+@@ -605,6 +666,11 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * @param frequency
+      */
+     public void powerUpAsync(float frequency) {
++        if (mDestroying) return;
++        if (mBcmHci) {
++            mBcmStopRequested = false;
++            mBcmDucked = false;
++        }
+         final int bundleSize = 1;
+         mFmServiceHandler.removeMessages(FmListener.MSGID_POWERUP_FINISHED);
+         mFmServiceHandler.removeMessages(FmListener.MSGID_POWERDOWN_FINISHED);
+@@ -616,6 +682,16 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private boolean powerUp(float frequency) {
++        if (mBcmHci) {
++            if (mDestroying || mBcmStopRequested) return false;
++            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
++            if (adapter == null || !adapter.isEnabled()) {
++                bcmNotice(R.string.bcm_fm_enable_bluetooth);
++                return false;
++            }
++            if (!isAntennaAvailable() || mAudioManager.getMode() != AudioManager.MODE_NORMAL
++                    || mAudioManager.isBluetoothScoOn()) return false;
++        }
+         if (mPowerStatus == POWER_UP) {
+             return true;
+         }
+@@ -625,6 +701,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         if (!requestAudioFocus()) {
+             // activity used for update powerdown menu
+             mPowerStatus = POWER_DOWN;
++            if (mBcmHci && mWakeLock.isHeld()) mWakeLock.release();
+             return false;
+         }
+ 
+@@ -638,9 +715,19 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+ 
+         if (!FmNative.powerUp(frequency)) {
+             mPowerStatus = POWER_DOWN;
++            if (mBcmHci) {
++                mBcmAudio.stop();
++                abandonAudioFocus();
++                if (mWakeLock.isHeld()) mWakeLock.release();
++                bcmNotice(R.string.bcm_fm_failed);
++            }
+             return false;
+         }
+         mPowerStatus = POWER_UP;
++        if (mBcmHci) {
++            mFmServiceHandler.removeCallbacks(mBcmHealth);
++            mFmServiceHandler.postDelayed(mBcmHealth, 2000);
++        }
+         // need mute after power up
+         setMute(true);
+ 
+@@ -665,11 +752,19 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+             setForceUse(mIsSpeakerUsed);
+         }
+         if (mRecordState != FmRecorder.STATE_PLAYBACK) {
+-            enableFmAudio(true);
++            boolean audioEnabled = enableFmAudio(true);
++            if (mBcmHci && !audioEnabled) {
++                powerDown();
++                return false;
++            }
+         }
+ 
+         setRds(true);
+-        setMute(false);
++        int unmuted = setMute(false);
++        if (mBcmHci && unmuted != 1) {
++            powerDown();
++            return false;
++        }
+ 
+         return (mPowerStatus == POWER_UP);
+     }
+@@ -678,6 +773,11 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * power down FM
+      */
+     public void powerDownAsync() {
++        if (mBcmHci) {
++            mBcmStopRequested = true;
++            FmNative.stopScan();
++            mBcmAudio.stop();
++        }
+         // if power down Fm, should remove message first.
+         // not remove all messages, because such as recorder message need
+         // to execute after or before power down
+@@ -695,6 +795,11 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * @return true if power down success
+      */
+     private boolean powerDown() {
++        if (mBcmHci) {
++            mFmServiceHandler.removeCallbacks(mBcmHealth);
++            FmNative.stopScan();
++            mBcmAudio.stop();
++        }
+         if (mPowerStatus == POWER_DOWN) {
+             return true;
+         }
+@@ -707,7 +812,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         setRds(false);
+         enableFmAudio(false);
+ 
+-        if (!FmNative.powerDown(0)) {
++        boolean nativeDown = FmNative.powerDown(0);
++        // Link loss still requires local state/focus/notification cleanup.
++        if (mBcmHci) abandonAudioFocus();
++        if (!nativeDown && !mBcmHci) {
+ 
+             if (isRdsSupported()) {
+                 stopRdsThread();
+@@ -988,6 +1096,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * @return (1, success; other, failed)
+      */
+     public int setMute(boolean mute) {
++        if (mBcmHci && mBcmDucked) mute = true;
+         if (mPowerStatus != POWER_UP) {
+             Log.w(TAG, "setMute, FM is not powered up");
+             return -1;
+@@ -1117,6 +1226,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private void startRecording() {
++        if (mBcmHci) {
++            onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
++            return;
++        }
+         sRecordingSdcard = FmUtils.getDefaultStoragePath();
+         if (sRecordingSdcard == null || sRecordingSdcard.isEmpty()) {
+             Log.d(TAG, "startRecording, may be no sdcard");
+@@ -1276,20 +1389,23 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     public void onCreate() {
+         super.onCreate();
+         mContext = getApplicationContext();
++        mBcmHci = getResources().getBoolean(R.bool.config_bcmHciFm);
++        FmNative.init(mBcmHci);
+         mAudioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
++        if (mBcmHci) mBcmAudio = new BcmFmAudio(mAudioManager);
+         mActivityManager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+         PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+         mWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+         mWakeLock.setReferenceCounted(false);
+         sRecordingSdcard = FmUtils.getDefaultStoragePath();
+ 
+-        registerFmBroadcastReceiver();
+         registerSdcardReceiver();
+         registerAudioPortUpdateListener();
+ 
+         HandlerThread handlerThread = new HandlerThread("FmRadioServiceThread");
+         handlerThread.start();
+         mFmServiceHandler = new FmRadioServiceHandler(handlerThread.getLooper());
++        registerFmBroadcastReceiver();
+ 
+         openDevice();
+         // set speaker to default status, avoid setting->clear data.
+@@ -1318,6 +1434,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     // Thread 1: onCreate() or startRender()
+     // Thread 2: onAudioPatchListUpdate() or startRender()
+     private synchronized void initAudioRecordSink() {
++        if (mBcmHci) return;
+         mAudioRecord = new AudioRecord(MediaRecorder.AudioSource.RADIO_TUNER,
+                 SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, RECORD_BUF_SIZE);
+         mAudioTrack = new AudioTrack(AudioManager.STREAM_MUSIC,
+@@ -1380,6 +1497,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+          */
+         @Override
+         public void onAudioPatchListUpdate(AudioPatch[] patchList) {
++            if (mBcmHci) return;
+             if (mPowerStatus != POWER_UP) {
+                 Log.d(TAG, "onAudioPatchListUpdate, not power up");
+                 return;
+@@ -1427,6 +1545,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+          */
+         @Override
+         public void onServiceDied() {
++            if (mBcmHci) {
++                FmNative.stopScan();
++                powerDownAsync();
++            }
+             enableFmAudio(false);
+         }
+     }
+@@ -1448,6 +1570,11 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         filter.addAction(Intent.ACTION_SCREEN_ON);
+         filter.addAction(Intent.ACTION_SCREEN_OFF);
+         filter.addAction(Intent.ACTION_HEADSET_PLUG);
++        if (mBcmHci) {
++            filter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
++            filter.addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED);
++            filter.addAction("android.media.VOLUME_CHANGED_ACTION");
++        }
+         mBroadcastReceiver = new FmServiceBroadcastReceiver();
+         registerReceiver(mBroadcastReceiver, filter);
+     }
+@@ -1461,6 +1588,12 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+ 
+     @Override
+     public void onDestroy() {
++        mDestroying = true;
++        if (mBcmHci) {
++            mFmServiceHandler.removeCallbacks(mBcmHealth);
++            FmNative.stopScan();
++            mBcmAudio.stop();
++        }
+         mAudioManager.setParameters("AudioFmPreStop=1");
+         setMute(true);
+         // stop rds first, avoid blocking other native method
+@@ -1679,12 +1812,28 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      *
+      * @param enable true, open FM audio; false, close FM audio;
+      */
+-    private void enableFmAudio(boolean enable) {
++    private boolean enableFmAudio(boolean enable) {
++        if (mBcmHci) {
++            if (!enable) {
++                mBcmAudio.stop();
++                return true;
++            }
++            if (mDestroying || mBcmStopRequested || mPowerStatus != POWER_UP
++                    || !mIsAudioFocusHeld) return false;
++            if (mBcmDucked) return true; // keep tuner state, but no direct audio route
++            boolean ok = mBcmAudio.start(mIsSpeakerUsed) && bcmVolume();
++            if (!ok) {
++                mBcmAudio.stop();
++                bcmNotice(R.string.bcm_fm_failed);
++                powerDownAsync();
++            }
++            return ok;
++        }
+         if (enable) {
+             if ((mPowerStatus != POWER_UP) || !mIsAudioFocusHeld) {
+                 Log.d(TAG, "enableFmAudio, current not available return.mIsAudioFocusHeld:"
+                     + mIsAudioFocusHeld);
+-                return;
++                return false;
+             }
+ 
+             startAudioTrack();
+@@ -1693,6 +1842,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+             releaseAudioPatch();
+             stopRender();
+         }
++        return true;
+     }
+ 
+     private void startPatchOrRender() {
+@@ -2043,6 +2193,16 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                 @Override
+                 public void onAudioFocusChange(int focusChange) {
+                     Log.d(TAG, "onAudioFocusChange " + focusChange);
++                    if (mBcmHci && focusChange < 0) {
++                        if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK)
++                            mBcmDucked = true;
++                        else
++                            mBcmStopRequested = true;
++                        FmNative.stopScan();
++                        // Stop the direct route now, before a worker blocked in
++                        // seek has had time to process the focus-loss message.
++                        mBcmAudio.stop();
++                    }
+                     switch (focusChange) {
+                         case AudioManager.AUDIOFOCUS_LOSS:
+                             synchronized (this) {
+@@ -2100,6 +2260,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * @param focusState AudioManager state
+      */
+     private void updateAudioFocus(int focusState) {
++        if (mBcmHci && focusState == AudioManager.AUDIOFOCUS_GAIN) mBcmDucked = false;
+         switch (focusState) {
+             case AudioManager.AUDIOFOCUS_LOSS:
+                 mPausedByTransientLossOfFocus = false;
+@@ -2150,6 +2311,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                     FmUtils.setIsSpeakerModeOnFocusLost(mContext, false);
+                 }
+                 if ((mPowerStatus != POWER_UP) && mPausedByTransientLossOfFocus) {
++                    if (mBcmHci) mBcmStopRequested = false;
+                     final int bundleSize = 1;
+                     mFmServiceHandler.removeMessages(FmListener.MSGID_POWERUP_FINISHED);
+                     mFmServiceHandler.removeMessages(FmListener.MSGID_POWERDOWN_FINISHED);
+@@ -2157,6 +2319,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                     bundle.putFloat(FM_FREQUENCY, FmUtils.computeFrequency(mCurrentStation));
+                     handlePowerUp(bundle);
+                 }
++                if (mBcmHci && mPowerStatus == POWER_UP && !enableFmAudio(true)) {
++                    powerDownAsync();
++                    break;
++                }
+                 setMute(false);
+                 break;
+ 
+@@ -2171,7 +2337,8 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+ 
+     private void forceToHeadsetMode() {
+         if (mIsSpeakerUsed && isHeadSetIn()) {
+-            AudioSystem.setForceUse(FOR_PROPRIETARY, AudioSystem.FORCE_NONE);
++            if (mBcmHci) mBcmAudio.selectSpeaker(false);
++            else AudioSystem.setForceUse(FOR_PROPRIETARY, AudioSystem.FORCE_NONE);
+             // save user's option to shared preferences.
+             FmUtils.setIsSpeakerModeOnFocusLost(mContext, true);
+         }
+@@ -2625,7 +2792,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+             return;
+         }
+         if (powerUp(curFrequency)) {
+-            if (FmUtils.isFirstTimePlayFm(mContext)) {
++            if (!mBcmHci && FmUtils.isFirstTimePlayFm(mContext)) {
+                 isPowerUp = firstPlaying(curFrequency);
+                 FmUtils.setIsFirstTimePlayFm(mContext);
+             } else {

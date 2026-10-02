@@ -1,0 +1,1501 @@
+From 73cc7cbc3bcb32f73def00cb403dd3afa153b872 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH] a6lte: integrate experimental Broadcom HCI FM
+
+Package the separate JNI receiver backend and FMRadio, select the
+Bluetooth-owned endpoint and grant only system_app socket connect.
+Implement EU-band power/tune/readback/seek/scan/cancel/mute/volume
+with bounded failures and rollback, plus mock-controller tests.
+
+Use current vendor firmware without adding blobs or kernel drivers.
+Requires companion patches in system/bt and packages/apps/FMRadio.
+Hardware-unverified: protocol/audio assumptions are documented;
+RDS/AF, recording and FM-to-Bluetooth audio remain disabled.
+---
+ BoardConfig.mk                                |   6 +
+ bluetooth/bdroid_buildcfg.h                   |   2 +
+ device.mk                                     |   5 +
+ docs/fm-integration.md                        | 181 +++++++++++++
+ docs/fm-radio.md                              |  68 ++---
+ fm/Android.mk                                 |  14 +
+ fm/BcmFmProtocol.h                            |  74 ++++++
+ fm/BcmFmRadio.cpp                             | 226 ++++++++++++++++
+ fm/BcmFmRadio.h                               |  56 ++++
+ fm/FmJni.cpp                                  | 130 +++++++++
+ fm/README.md                                  |  17 ++
+ fm/tests/radio_test.cpp                       | 246 ++++++++++++++++++
+ fm/tests/run_host_tests.py                    |  49 ++++
+ fm/tests/server_test.cpp                      | 136 ++++++++++
+ fm/tests/stack_stubs/bt_target.h              |   4 +
+ fm/tests/stack_stubs/hci_layer.h              |   8 +
+ fm/tests/stack_stubs/media/AudioSystem.h      |  15 ++
+ fm/tests/stack_stubs/osi/include/allocator.h  |   4 +
+ fm/tests/stack_stubs/osi/include/log.h        |   4 +
+ fm/tests/stack_stubs/utils/String8.h          |   3 +
+ lineage.dependencies                          |   5 +
+ .../apps/FMRadio/res/values/config.xml        |   5 +
+ sepolicy/fmradio.te                           |   4 +
+ 23 files changed, 1217 insertions(+), 45 deletions(-)
+ create mode 100644 docs/fm-integration.md
+ create mode 100644 fm/Android.mk
+ create mode 100644 fm/BcmFmProtocol.h
+ create mode 100644 fm/BcmFmRadio.cpp
+ create mode 100644 fm/BcmFmRadio.h
+ create mode 100644 fm/FmJni.cpp
+ create mode 100644 fm/README.md
+ create mode 100644 fm/tests/radio_test.cpp
+ create mode 100644 fm/tests/run_host_tests.py
+ create mode 100644 fm/tests/server_test.cpp
+ create mode 100644 fm/tests/stack_stubs/bt_target.h
+ create mode 100644 fm/tests/stack_stubs/hci_layer.h
+ create mode 100644 fm/tests/stack_stubs/media/AudioSystem.h
+ create mode 100644 fm/tests/stack_stubs/osi/include/allocator.h
+ create mode 100644 fm/tests/stack_stubs/osi/include/log.h
+ create mode 100644 fm/tests/stack_stubs/utils/String8.h
+ create mode 100644 overlay/packages/apps/FMRadio/res/values/config.xml
+ create mode 100644 sepolicy/fmradio.te
+
+diff --git a/BoardConfig.mk b/BoardConfig.mk
+index 73414ef..efc0229 100644
+--- a/BoardConfig.mk
++++ b/BoardConfig.mk
+@@ -49,6 +49,9 @@ BOARD_HAVE_BLUETOOTH := true
+ BOARD_HAVE_BLUETOOTH_BCM := true
+ BOARD_HAVE_SAMSUNG_BLUETOOTH := true
+ 
++# FM radio: userspace HCI backend, NOT the V4L2 BOARD_HAVE_BCM_FM backend
++BOARD_HAVE_BCM_FM_HCI := true
++
+ # Kernel
+ TARGET_KERNEL_CONFIG := exynos7870-a6lte_defconfig
+ 
+@@ -103,3 +106,6 @@ WIFI_BAND                        := 802_11_ABG
+ 
+ # inherit from the proprietary version
+ -include vendor/samsung/a6lte/BoardConfigVendor.mk
++
++# The common tree assigns BOARD_SEPOLICY_DIRS; append device policy afterward.
++BOARD_SEPOLICY_DIRS += device/samsung/a6lte/sepolicy
+diff --git a/bluetooth/bdroid_buildcfg.h b/bluetooth/bdroid_buildcfg.h
+index ee89c6f..1546883 100644
+--- a/bluetooth/bdroid_buildcfg.h
++++ b/bluetooth/bdroid_buildcfg.h
+@@ -18,6 +18,8 @@
+ #ifndef _BDROID_BUILDCFG_H
+ #define _BDROID_BUILDCFG_H
+ 
++#define BRCM_FM_HCI_INCLUDED TRUE
++
+ #define BTM_DEF_LOCAL_NAME   "Samsung Galaxy J5 2017"
+ 
+ #define BTM_WBS_INCLUDED        TRUE    /* Enable WBS */
+diff --git a/device.mk b/device.mk
+index da880ff..ccb4c02 100644
+--- a/device.mk
++++ b/device.mk
+@@ -82,6 +82,11 @@ PRODUCT_PACKAGES += \
+ PRODUCT_COPY_FILES += \
+     $(DEVICE_PATH)/bluetooth/bt_vendor.conf:vendor/etc/bluetooth/bt_vendor.conf
+ 
++# FM radio (requires companion system/bt and packages/apps/FMRadio patches)
++PRODUCT_PACKAGES += \
++    FMRadio \
++    libfmjni_bcm_hci
++
+ # Fingerprint
+ PRODUCT_PACKAGES += \
+     android.hardware.biometrics.fingerprint@2.1-service.samsung
+diff --git a/docs/fm-integration.md b/docs/fm-integration.md
+new file mode 100644
+index 0000000..ebb71b6
+--- /dev/null
++++ b/docs/fm-integration.md
+@@ -0,0 +1,181 @@
++# Experimental A6 Broadcom FM integration
++
++This is a **source-based integration candidate**, not a hardware-validated FM
++release. It uses the current A6 vendor repository at
++`f0c55d795a9be60147d76a42ec93fd9ba3e5800f` (`lineage-18.1`), the supplied stock dump,
++and the Broadcom FM register protocol. A stock log is useful but is **not required
++to build or try this candidate**. No vendor blobs or kernel files are changed.
++The current vendor's `bcm4345C5_V0069.0172.hcd` is byte-identical to the dump
++(SHA-256 `fe5d61771d2e26310f295ee7241b5d188b80d80d3b6805f4a6452d52783a2225`).
++
++Apply the companion patches to **both** `system/bt` and `packages/apps/FMRadio`,
++then apply the device patches. Adding only `FMRadio` to PRODUCT_PACKAGES, or
++applying only this device patch, is not sufficient.
++
++## Source baselines
++
++| Project | Revision | Inspected base |
++| --- | --- | --- |
++| device/samsung/a6lte | samsungexynos7870 lineage-18.1 | `a6b97426994a2d03df18087ed8b8c4c84a69905c` |
++| vendor/samsung/a6lte | samsungexynos7870 lineage-18.1 | `f0c55d795a9be60147d76a42ec93fd9ba3e5800f` |
++| device/samsung/universal7870-common | samsungexynos7870 lineage-18.1-oss_bsp-vndk | `a433c37b08659956b366e06019c36e310a0b2781` |
++| vendor/samsung/universal7870-common | samsungexynos7870 lineage-18.1-lts | `5c77cae3529a5ca03f12a5988a7cb0247bbced96` |
++| kernel/samsung/exynos7870 | samsungexynos7870 lineage-18.1-lts | `e41078f882271fe43089a683a200bdab8803483b` |
++| system/bt | LineageOS lineage-18.1 | `bcca9a572f1cc539ba21ebe940c3642ce8707d1a` |
++| packages/apps/FMRadio | LineageOS lineage-18.1 | `c8664126026de37a442dba996db8bc4d3606dc41` |
++
++Use the other BSP/policy projects from the supplied
++[j5y17lte LTS manifest](https://github.com/samsungexynos7870/android_manifest_samsung_j5y17lte/blob/lineage-18.1-lts/j5y17lte.xml),
++substituting the A6 device and vendor projects. See `fm-radio.md` for stock
++hardware evidence. That document records the earlier investigation; the
++implementation and current status are described here.
++
++## Architecture
++
++```
++platform-signed FMRadio (system UID, main Android user)
++    libfmjni_bcm_hci -> authenticated abstract SOCK_SEQPACKET endpoint
++        Bluetooth process / btif_bcm_fm
++            Fluoride transmit_command + its existing credits/completions
++                existing Bluetooth HAL -> existing UART -> BCM4345C5 firmware
++
++FMRadio -> AudioManager l_fmradio_mode -> Samsung SEC audio HAL
++    existing FM DAI 4 + fm_radio-{headset,speaker} mixer paths
++```
++
++* The controller remains owned by Bluetooth. The FM code never opens the UART,
++  loads firmware, changes line discipline, resets the controller, enables
++  `/dev/radio0`, or rewrites I2S/PCM pins. Bluetooth must be enabled by the user;
++  FM does not silently change that preference or disable Bluetooth on exit.
++* The endpoint is created after Bluetooth initialization and stopped before HCI
++  teardown. Only UID 1000 can connect; the client checks the server's UID 1002.
++  Only one FM session is accepted. The protocol allowlist validates exact
++  register widths and values and permits only the needed `0xfc15` operations,
++  **not arbitrary vendor commands or `0xfc61` pin control**.
++* There is one outstanding FM transaction, using the existing HCI queue.
++  Responses, errors, shutdown, late callbacks and 1.5-second timeouts have
++  explicit ownership/lifetime handling. A timed-out endpoint requires a
++  Bluetooth toggle before retry rather than piling ambiguous retries into HCI.
++  Bluetooth's own controller watchdog can still reset Bluetooth if firmware
++  hangs on an FM command; this cannot be ruled out without hardware testing.
++* On client death the broker attempts FM OFF and resets the SEC audio route.
++  On adapter shutdown it does not submit new commands to a tearing-down HCI
++  layer; Bluetooth then owns controller power-off.
++* The device enables `BOARD_HAVE_BCM_FM_HCI` and `BRCM_FM_HCI_INCLUDED` plus the
++  app overlay. Do **not** substitute `BOARD_HAVE_BCM_FM`: that selects the
++  unrelated V4L2 backend. The separate `libfmjni_bcm_hci` soname avoids collisions.
++* SELinux adds only `system_app -> bluetooth:unix_stream_socket connectto`.
++  No permissive domain, UART/device grants, shell socket access or vendor HAL
++  access is added. The broker also authenticates UID and validates requests.
++
++## Implemented paths and deliberate limits
++
++* Power on/off, exact tune/readback, seek in both directions with bounded wrap,
++  bounded station scan and cancellation, mute, and receiver digital volume.
++* **EU band only:** 87.5–108 MHz, 100-kHz grid, 50-us de-emphasis. Region selection
++  for other bands/de-emphasis values is not implemented.
++* Uses existing FMRadio favorites/station UI. Requires a wired headset/headphone
++  antenna; output can be selected between wired headphones and the speaker.
++* Explicit failure messages when Bluetooth is off or the backend is unavailable.
++  Link health is checked while playing. Bluetooth shutdown, headset removal,
++  focus loss and SCO audio activation stop the FM route; long scans are cancelled
++  rather than leaving power-off queued behind a scan.
++* **RDS/AF and recording are disabled.** The backend reports RDS unsupported and
++  the recording actions are hidden/rejected. No fake station metadata is returned.
++* **No FM-to-A2DP/SCO playback**, no secondary-user support, and no automatic
++  Bluetooth power management. Normal Bluetooth/Wi-Fi coexistence is a test item,
++  not yet a verified claim.
++
++## What is inferred rather than proven
++
++The dump proves the Broadcom stack and SEC audio paths exist. It does **not**
++prove that this initialization sequence works with the exact running firmware.
++
++The receiver engine independently implements the register framing and constants
++published in Broadcom's V4L2 FM sources (for reference,
++[`fmdrv_main.h`](https://github.com/arttttt/SmokeR24.1-kernel/blob/SmokeR24.1-stable/drivers/bluetooth/broadcom/v4l2_fm_driver/fmdrv_main.h)
++and adjacent receive-driver files). The code is not an import of that kernel
++transport, nor does that other board's existence validate the A6. It expects
++Command Complete to include the register/access echo; it fails closed on a
++status error, different framing, wrong tune readback or missing completion.
++
++The candidate uses stock RSSI/SNR thresholds 105/10, FM I2S output, muted/zero
++volume startup, and the board's existing Bluetooth I2S configuration. It polls
++status flags with interrupts masked, rather than installing another event owner.
++Whether those flags latch as expected on BCM4345C5 must be checked on the phone.
++
++Audio uses the stock HAL's `l_fmradio_mode=ready/on/off` path plus a looping silent
++MUSIC AudioTrack to keep the primary route active. The real audio is the hardware
++FM input, **not** a software loopback. Output is selected per AudioTrack rather
++than globally forcing other apps to speaker. Receiver gain follows the MUSIC
++dB curve because scaling the silent samples cannot control direct FM audio.
++The SEC HAL's handling of that route, I2S clocks, volume mapping, speaker output,
++and standby still need device validation. A successful AudioTrack call is not
++proof that FM sound reached the codec. Test initially at a low volume.
++
++## Build and first test (no stock log needed)
++
++After applying all project patches, use your normal source setup and lunch:
++
++```sh
++source build/envsetup.sh
++lunch lineage_a6lte-userdebug
++m FMRadio libfmjni_bcm_hci libbluetooth
++# Then build a complete ROM so the device policy and firmware config are included:
++m bacon
++```
++
++No complete Android build was run in the dump workspace. Building just these
++modules is only an early check; do not sideload an APK alone and expect the
++Bluetooth endpoint or policy to be present. Follow the device's normal backup,
++installation and recovery procedures; there is no new bootloader/partition step.
++
++1. Keep SELinux enforcing. Verify normal Bluetooth operation and firmware loading.
++2. Enable Bluetooth, connect wired headphones and start FMRadio in the primary
++   user. Tune a known local station at low MUSIC volume. The first run uses the
++   selected frequency instead of automatically seeking, to simplify bring-up.
++3. If it fails, use the new ROM's logs (not a stock log):
++
++   ```sh
++   adb logcat -c
++   # Reproduce once, then:
++   adb logcat -d -v threadtime -s BcmFm bt_bcm_fm BcmFmAudio AndroidRuntime audio_hw_primary
++   adb shell dumpsys media.audio_flinger
++   adb shell dumpsys media.audio_policy
++   ```
++
++   On userdebug builds, inspect AVC denials with your usual privileged logging
++   workflow. Do not switch to permissive to hide them. Inspect/redact logs before
++   sharing. The offline decoder in `tools/fm` remains available for an optional
++   HCI capture, but capturing stock is no longer a gate for testing this code.
++4. A non-zero controller status or incompatible completion identifies the
++   protocol stage to investigate. Successful tune/readback but silence directs
++   investigation to the HAL route/PCM/I2S path. After a transport timeout, toggle
++   Bluetooth before retrying. Never open the UART from a second process.
++5. Test repeated on/off, scan cancellation, mute and volume zero, both outputs,
++   headset removal, suspend/resume, app force-stop/crash, calls/SCO, Wi-Fi and
++   Bluetooth toggles. Verify radio and FM PCM clocks are off after app exit.
++
++## Host checks
++
++From the device tree, on Linux:
++
++```sh
++python3 -m unittest discover -s tools/fm/tests -v
++python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt"
++python3 fm/tests/run_host_tests.py --bt-tree "$ANDROID_BUILD_TOP/system/bt" --sanitize
++```
++
++The native suite has 24 mock-controller test groups, including failure injection
++at every power-on I/O step. Six broker/socket test scenarios exercise exclusivity,
++peer rejection, bad requests, client death, timeouts, late callbacks, adapter
++restart/shutdown and callback ownership. The broker tests compile the real broker
++against **host mocks** for HCI/audio/peer credentials; they are not Android HAL or
++SELinux tests. ASan/UBSan passed in the development workspace.
++
++The patched app Java sources were type-checked against Android 11 API classes
++with generated **test** R constants. JNI declarations were checked against
++`javac -h` headers, and the JNI source was host-compiled with a log stub. These
++checks do not replace Android resource packaging, ABI builds, policy compilation
++or hardware tests. All git-am patches are additionally applied to pristine
++source snapshots and compared with the authoring trees.
+diff --git a/docs/fm-radio.md b/docs/fm-radio.md
+index 9e8f8c0..de79b6b 100644
+--- a/docs/fm-radio.md
++++ b/docs/fm-radio.md
+@@ -2,12 +2,12 @@
+ 
+ ## Status
+ 
+-**Not a working FM implementation.** This change fixes the Bluetooth firmware
+-filename and provides an offline trace decoder and an integration plan. It does
+-not yet add an FM app/backend, claim reception or audio works, or relax SELinux.
+-A stock A6 FM trace and device testing are needed before implementing the missing
+-transport and audio integration. The Python tests exercise the decoder, not FM
+-hardware, an Android build, or Bluetooth firmware loading.
++A source-based, hardware-unverified integration candidate is now implemented.
++See **[fm-integration.md](fm-integration.md)** for the current architecture, build
++instructions, supported paths and limitations. This page preserves the stock
++findings and optional capture workflow. A stock log is **not a prerequisite** for
++building or trying the candidate. Neither host tests nor binary inspection prove
++that reception or audio works on an A6.
+ 
+ ## Source selection
+ 
+@@ -81,10 +81,11 @@ separate UART/line-discipline port; it is not an app-only change.
+ Samsung's `HybridRadio.apk` also depends on Samsung framework/Bluetooth APIs;
+ copying the APK alone is not an integration.
+ 
+-## Next required input: a stock receive session
++## Optional follow-up: a stock receive session
+ 
+-Use a stock **A6**, not a J5 or another BCM device. Firmware register definitions,
+-I2S pin routing, and power sequencing must be established for this board.
++Use a stock **A6**, not a J5 or another BCM device. A trace can verify firmware register definitions,
++I2S pin routing, and power sequencing against this board. The current candidate
++uses documented protocol behavior and existing board configuration in its absence.
+ 
+ 1. Connect wired headphones (the antenna). In Developer options enable full
+    Bluetooth HCI snoop logging if available. Restart Bluetooth as required by
+@@ -129,42 +130,19 @@ identify PCM/routing state but do not replace tracing the Samsung audio
+ parameter sequence. Do not infer that a string found in the HAL is sufficient
+ to enable audio.
+ 
+-## Full integration work still outstanding
+-
+-Preferred architecture to evaluate against the stock trace:
+-
+-1. **Bluetooth transport (`system/bt`)**: add a device-gated, narrowly scoped FM
+-   endpoint which submits commands through Fluoride's existing HCI queue. Keep
+-   command credits, completion ownership, Bluetooth power/lifetime, client
+-   death, timeouts, and concurrent SCO use under one owner. Authenticate clients
+-   and restrict operations; never expose an arbitrary HCI injector over TCP.
+-   Opening `/dev/ttySAC0` independently while Bluetooth owns it is not safe.
+-2. **FM backend/app**: provide a separate HCI backend implementing the Lineage
+-   FMRadio native interface. Integrate adapter lifecycle and a user-visible
+-   failure path; do not reuse the MTK ioctl backend or install two `libfmjni`
+-   modules. Implement power, tune, seek/cancel, mute, scan, and RDS according to
+-   the A6's observed responses, including timeout/error recovery.
+-3. **Audio integration**: validate the Samsung HAL parameter/PCM lifecycle,
+-   output selection, audio focus, stream volume, recording input, headset
+-   removal, and call/SCO preemption. Reuse the existing board mixer controls
+-   where applicable; do not toggle mixers underneath AudioFlinger. Establish
+-   whether the existing FM input policy needs an attached-device declaration
+-   or dynamic connection handling.
+-4. **Device/policy wiring**: only after the backend is implemented, package the
+-   app and backend, add its dependency/config selection, and grant the minimum
+-   required IPC permissions. Preserve enforcing SELinux. No global permissive
+-   mode, generic app device access, or blanket vendor-command access.
+-5. **Validate**: build the ROM and policy; verify firmware loading and normal
+-   Bluetooth before FM testing. On the phone test cold/warm power cycles, weak
+-   and strong stations, tune/readback, seek/cancel, RDS, volume/mute, speaker and
+-   headset, recording if exposed, suspend/resume, incoming calls, SCO/A2DP,
+-   Wi-Fi coexistence, Bluetooth toggles, app crash, and repeated FM start/stop.
+-   Confirm the receiver is powered down when the FM client exits.
+-
+-No kernel change is currently justified for the proposed userspace HCI design.
+-That is a design choice to validate, not a statement that all kernel/audio
+-support has already been tested. The stock trace is the next gate; full app
+-integration is not completed by these preparatory patches.
++## Implementation and remaining validation
++
++The Bluetooth-owned command endpoint, FMRadio JNI backend, device selection,
++app lifecycle, direct SEC audio path and narrow IPC policy are implemented in
++the companion patch series. No kernel radio driver or stock APK transplant is
++used. See [fm-integration.md](fm-integration.md) for implementation details.
++
++Remaining work is an Android/SELinux build, phone validation of the inferred
++protocol and audio sequence, and implementation/validation of the deliberately
++disabled RDS/AF and recording features. Regional modes beyond the EU band,
++secondary users, and FM-to-Bluetooth audio are not supported in this candidate.
++Normal Bluetooth/Wi-Fi coexistence also needs hardware testing. A stock trace
++can refine the implementation later; new-ROM failure logs can be used first.
+ 
+ ## Host tests
+ 
+diff --git a/fm/Android.mk b/fm/Android.mk
+new file mode 100644
+index 0000000..7d6d1f4
+--- /dev/null
++++ b/fm/Android.mk
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 The LineageOS Project
++LOCAL_PATH := $(call my-dir)
++
++ifeq ($(BOARD_HAVE_BCM_FM_HCI),true)
++include $(CLEAR_VARS)
++LOCAL_MODULE := libfmjni_bcm_hci
++LOCAL_SRC_FILES := BcmFmRadio.cpp FmJni.cpp
++LOCAL_HEADER_LIBRARIES := jni_headers
++LOCAL_SHARED_LIBRARIES := liblog
++LOCAL_CPPFLAGS := -std=c++17 -Wall -Wextra -Werror
++LOCAL_MULTILIB := both
++include $(BUILD_SHARED_LIBRARY)
++endif
+diff --git a/fm/BcmFmProtocol.h b/fm/BcmFmProtocol.h
+new file mode 100644
+index 0000000..f5c8e3b
+--- /dev/null
++++ b/fm/BcmFmProtocol.h
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace bcmfm {
++// Abstract AF_UNIX/SOCK_SEQPACKET socket. HCI command/event bytes, no H4 prefix.
++constexpr char kSocket[] = "a6lte.bcm_fm.v1";
++constexpr uint32_t kClientUid = 1000;     // platform FMRadio's android.uid.system
++constexpr uint32_t kServerUid = 1002;     // Bluetooth app, NOT the vendor HAL
++constexpr size_t kMaxEvent = 257;
++constexpr int kLowKHz = 87500;
++constexpr int kHighKHz = 108000;
++constexpr int kStepKHz = 100;
++inline bool validFrequency(int khz) {
++    return khz >= kLowKHz && khz <= kHighKHz && khz % kStepKHz == 0;
++}
++inline uint16_t le16(const uint8_t* p) { return p[0] | (uint16_t(p[1]) << 8); }
++
++// Defence in depth: no generic HCI access, pin mux, RAM, firmware or RDS FIFO
++// operations. Match every request length and value before it enters Fluoride.
++inline bool allowed(const uint8_t* p, size_t n) {
++    if (n < 6 || n > 7 || p[0] != 0x15 || p[1] != 0xfc || p[2] != n - 3)
++        return false;
++    const uint8_t reg = p[3], access = p[4];
++    if (access == 1) {
++        if (n != 6) return false;
++        switch (reg) {
++            case 0x00: case 0x01: case 0x0f: case 0x4d: case 0xdf:
++                return p[5] == 1;
++            case 0x05: case 0x0a: case 0x12:
++                return p[5] == 2;
++            default: return false;
++        }
++    }
++    if (access != 0) return false;
++    if (n == 6) {
++        switch (reg) {
++            case 0x00: return p[5] <= 1;       // FM off/on, no RDS yet
++            case 0x01: return p[5] == 0x02;    // west band, auto stereo
++            case 0x07: return p[5] == 105 || p[5] == (105 | 0x80);
++            case 0x08: return p[5] == 10;      // stock SNR threshold
++            case 0x09: return p[5] <= 2;       // cancel, preset, seek
++            case 0xfc: case 0xfe: return p[5] == 0;
++            case 0xfd: return p[5] == 1;       // 100 kHz
++            default: return false;
++        }
++    }
++    const uint16_t value = le16(p + 5);
++    switch (reg) {
++        case 0x05: return value == 0x2d || value == 0x2f; // I2S, 50us, mute bit
++        case 0x0a: return validFrequency(value + 64000);
++        case 0x10: return value == 0;           // poll flags; no async interrupts
++        case 0xf8: return value <= 255;
++        default: return false;
++    }
++}
++
++// Require the register/access echo; do not guess around incompatible firmware.
++inline bool response(const std::vector<uint8_t>& request,
++                     const std::vector<uint8_t>& event, std::vector<uint8_t>* data) {
++    if (!allowed(request.data(), request.size()) || event.size() < 8 ||
++        event[0] != 0x0e || event[1] != event.size() - 2 ||
++        event[3] != 0x15 || event[4] != 0xfc || event[5] != 0 ||
++        event[6] != request[3] || event[7] != request[4]) return false;
++    const size_t expected = request[4] == 1 ? request[5] : 0;
++    if (event.size() != 8 + expected) return false;
++    data->assign(event.begin() + 8, event.end());
++    return true;
++}
++}  // namespace bcmfm
+diff --git a/fm/BcmFmRadio.cpp b/fm/BcmFmRadio.cpp
+new file mode 100644
+index 0000000..ea0b250
+--- /dev/null
++++ b/fm/BcmFmRadio.cpp
+@@ -0,0 +1,226 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#include "BcmFmRadio.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstdarg>
++#include <set>
++#ifdef __ANDROID__
++#include <android/log.h>
++#endif
++
++namespace {
++void logError(const char* format, ...) {
++    va_list args;
++    va_start(args, format);
++#ifdef __ANDROID__
++    __android_log_vprint(ANDROID_LOG_ERROR, "BcmFm", format, args);
++#else
++    std::fputs("BcmFm: ", stderr);
++    std::vfprintf(stderr, format, args);
++    std::fputc('\n', stderr);
++#endif
++    va_end(args);
++}
++}
++
++namespace bcmfm {
++bool Radio::write(uint8_t reg, int value, int width) {
++    Bytes request{0x15, 0xfc, static_cast<uint8_t>(2 + width), reg, 0,
++                  static_cast<uint8_t>(value)};
++    if (width == 2) request.push_back(static_cast<uint8_t>(value >> 8));
++    Bytes event, data;
++    bool ok = allowed(request.data(), request.size()) && bus_.exchange(request, &event) &&
++              response(request, event, &data);
++    if (!ok) logError("register write %02x failed", reg);
++    return ok;
++}
++bool Radio::read(uint8_t reg, int width, int* value) {
++    Bytes request{0x15, 0xfc, 3, reg, 1, static_cast<uint8_t>(width)}, event, data;
++    if (!bus_.exchange(request, &event) || !response(request, event, &data)) {
++        logError("register read %02x failed", reg);
++        return false;
++    }
++    *value = width == 2 ? le16(data.data()) : data[0];
++    return true;
++}
++
++bool Radio::powerUp(int khz) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!validFrequency(khz)) return false;
++    if (powered_) {
++        const int previous = frequency_;
++        if (tuneLocked(khz, cancel_.load())) return true;
++        restore(previous);
++        return false;
++    }
++    const uint64_t generation = cancel_.load();
++    if (!bus_.open()) return false;
++    connected_ = true;
++    auto initWrite = [&](uint8_t reg, int value, uint8_t width = 1) {
++        return generation == cancel_.load() && write(reg, value, width);
++    };
++    auto initRead = [&](uint8_t reg, uint8_t width, int* value) {
++        return generation == cancel_.load() && read(reg, width, value);
++    };
++    // Based on the documented Broadcom register protocol, not an observed A6
++    // sequence. Fail closed on any non-zero status, bad echo or unexpected size.
++    bool ok = initWrite(0x00, 1);
++    if (ok) clock_.sleepMs(300);
++    int system = 0, pcmRoute = 0;
++    ok = ok && initRead(0x00, 1, &system) && (system & 1) &&
++         initRead(0x4d, 1, &pcmRoute) && !(pcmRoute & 0x80) && // don't steal FM-over-SCO
++         initWrite(0x10, 0, 2) && initWrite(0x01, 0x02) && initWrite(0xfd, 1) &&
++         initWrite(0x08, 10) && initWrite(0xfc, 0) && initWrite(0xfe, 0) &&
++         initWrite(0xf8, 0, 2) && initWrite(0x05, 0x2f, 2);
++    // The existing board/vendor I2S configuration owns pin mux/clock roles.
++    // No FC61 pin writes, controller reset, firmware download or SCO reroute.
++    powered_ = ok;
++    muted_ = true;
++    if (!ok || !tuneLocked(khz, generation)) {
++        logError("power-up failed: SYS=%02x PCM_ROUTE=%02x requested=%d kHz", system, pcmRoute, khz);
++        down();
++        return false;
++    }
++    return true;
++}
++
++bool Radio::down() {
++    bool ok = true;
++    if (connected_) {
++        // Always try off, even if mute failed or initialization was only partial.
++        write(0x05, 0x2f, 2);
++        ok = write(0x00, 0);
++        bus_.close();
++    }
++    powered_ = connected_ = false;
++    muted_ = true;
++    return ok;
++}
++bool Radio::powerDown() {
++    cancel();
++    std::lock_guard<std::mutex> lock(mutex_);
++    return down();
++}
++
++Radio::Search Radio::search(int khz, bool seeking, bool up, uint64_t generation, int* found) {
++    if (!powered_ || !validFrequency(khz)) return Search::Error;
++    if (generation != cancel_.load()) return Search::Cancelled;
++    int stale;
++    if (!write(0x09, 0) || !read(0x12, 2, &stale) ||
++        (seeking && !write(0x07, 105 | (up ? 0x80 : 0))) ||
++        !write(0x0a, khz - 64000, 2) || !write(0x09, seeking ? 2 : 1)) return Search::Error;
++    const auto deadline = clock_.nowMs() + (seeking ? 20000 : 2000);
++    while (clock_.nowMs() < deadline) {
++        if (generation != cancel_.load()) {
++            write(0x09, 0);
++            return Search::Cancelled;
++        }
++        int flags;
++        if (!read(0x12, 2, &flags)) return Search::Error;
++        if (flags & 2) return seeking ? Search::BandLimit : Search::Error;
++        if (flags & 1) {
++            int value;
++            if (!read(0x0a, 2, &value) || !validFrequency(value + 64000)) {
++                logError("invalid frequency readback");
++                return Search::Error;
++            }
++            *found = value + 64000;
++            if (!seeking && *found != khz) {
++                logError("tune readback mismatch: requested=%d actual=%d kHz", khz, *found);
++                return Search::Error;
++            }
++            frequency_ = *found;
++            return Search::Found;
++        }
++        clock_.sleepMs(40);
++    }
++    write(0x09, 0);
++    logError("%s timeout", seeking ? "seek" : "tune");
++    return Search::Timeout;
++}
++
++bool Radio::tuneLocked(int khz, uint64_t generation) {
++    int found;
++    return search(khz, false, true, generation, &found) == Search::Found;
++}
++void Radio::restore(int khz) {
++    // Cancellation only terminates the search. Restore the previous channel so
++    // a failed/cancelled operation doesn't leave the UI and tuner disagreeing.
++    if (!tuneLocked(khz, cancel_.load())) down();
++}
++bool Radio::tune(int khz) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!powered_ || !validFrequency(khz)) return false;
++    const int previous = frequency_;
++    if (tuneLocked(khz, cancel_.load())) return true;
++    restore(previous);
++    return false;
++}
++
++int Radio::seekLocked(int khz, bool up, bool wrap, uint64_t generation) {
++    int next = khz + (up ? kStepKHz : -kStepKHz);
++    if (next > kHighKHz || next < kLowKHz) {
++        if (!wrap) return -1;
++        next = up ? kLowKHz : kHighKHz;
++        wrap = false;
++    }
++    int found = -1;
++    Search result = search(next, true, up, generation, &found);
++    if (result == Search::Found) return found;
++    if (result == Search::BandLimit && wrap && generation == cancel_.load()) {
++        result = search(up ? kLowKHz : kHighKHz, true, up, generation, &found);
++        if (result == Search::Found) return found;
++    }
++    return -1;
++}
++int Radio::seek(int khz, bool up) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!powered_ || !validFrequency(khz)) return -1;
++    const int previous = frequency_;
++    const int found = seekLocked(khz, up, true, cancel_.load());
++    if (found < 0) restore(previous);
++    return found;
++}
++
++std::vector<int> Radio::scan() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!powered_) return {};
++    const int previous = frequency_;
++    const auto generation = cancel_.load();
++    std::set<int> stations;
++    int cursor = kLowKHz - kStepKHz;
++    const auto deadline = clock_.nowMs() + 120000;
++    // Bound both iterations and elapsed time; firmware must not spin us forever
++    // by repeatedly returning the same frequency or implicitly wrapping.
++    for (int n = 0; n <= (kHighKHz - kLowKHz) / kStepKHz; ++n) {
++        if (generation != cancel_.load() || clock_.nowMs() >= deadline) break;
++        int found;
++        if (search(cursor + kStepKHz, true, true, generation, &found) != Search::Found) break;
++        if (found <= cursor || !stations.insert(found).second || found == kHighKHz) break;
++        cursor = found;
++    }
++    restore(previous);
++    if (generation != cancel_.load() || !powered_) return {};
++    return {stations.begin(), stations.end()};
++}
++bool Radio::mute(bool muted) {
++    // Focus-loss callbacks can arrive on the main thread during a search. Audio
++    // routing is stopped immediately by the app; don't wait behind a long seek.
++    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
++    if (!lock.owns_lock() || !powered_ || !write(0x05, muted ? 0x2f : 0x2d, 2)) return false;
++    muted_ = muted;
++    return true;
++}
++bool Radio::volume(int value) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return powered_ && value >= 0 && value <= 255 && write(0xf8, value, 2);
++}
++bool Radio::alive() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    int system;
++    if (powered_ && read(0x00, 1, &system) && (system & 1)) return true;
++    if (connected_) down();
++    return false;
++}
++}  // namespace bcmfm
+diff --git a/fm/BcmFmRadio.h b/fm/BcmFmRadio.h
+new file mode 100644
+index 0000000..fb04bdc
+--- /dev/null
++++ b/fm/BcmFmRadio.h
+@@ -0,0 +1,56 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#pragma once
++#include "BcmFmProtocol.h"
++#include <atomic>
++#include <mutex>
++
++namespace bcmfm {
++using Bytes = std::vector<uint8_t>;
++class Bus {
++public:
++    virtual ~Bus() = default;
++    virtual bool open() = 0;
++    virtual void close() = 0;
++    virtual bool exchange(const Bytes& request, Bytes* response) = 0;
++};
++class Clock {
++public:
++    virtual ~Clock() = default;
++    virtual int64_t nowMs() = 0;
++    virtual void sleepMs(int ms) = 0;
++};
++
++// All frequencies are integral kHz on a 100-kHz EU grid. Register values use
++// kHz minus 64000. Keep floating-point/JNI conversion outside this engine.
++class Radio {
++public:
++    Radio(Bus& bus, Clock& clock) : bus_(bus), clock_(clock) {}
++    bool powerUp(int khz);
++    bool powerDown();
++    bool tune(int khz);
++    int seek(int fromKHz, bool up);
++    std::vector<int> scan();
++    void cancel() { ++cancel_; }  // lock-free: must interrupt a blocked scan/seek
++    bool mute(bool muted);
++    bool volume(int value);      // 0..255, receiver digital gain
++    bool alive();
++private:
++    enum class Search { Found, BandLimit, Error, Cancelled, Timeout };
++    bool write(uint8_t reg, int value, int width = 1);
++    bool read(uint8_t reg, int width, int* value);
++    bool down();
++    Search search(int khz, bool seeking, bool up, uint64_t generation, int* found);
++    bool tuneLocked(int khz, uint64_t generation);
++    int seekLocked(int khz, bool up, bool wrap, uint64_t generation);
++    void restore(int khz);
++    Bus& bus_;
++    Clock& clock_;
++    std::mutex mutex_;
++    std::atomic<uint64_t> cancel_{0};
++    bool powered_ = false;
++    bool connected_ = false;
++    bool muted_ = true;
++    int frequency_ = kLowKHz;
++};
++}  // namespace bcmfm
+diff --git a/fm/FmJni.cpp b/fm/FmJni.cpp
+new file mode 100644
+index 0000000..85cb222
+--- /dev/null
++++ b/fm/FmJni.cpp
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#include "BcmFmRadio.h"
++#include <jni.h>
++#include <android/log.h>
++#include <cerrno>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <thread>
++#include <unistd.h>
++
++namespace {
++class SocketBus final : public bcmfm::Bus {
++public:
++    bool open() override {
++        close();
++        fd_ = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++        if (fd_ < 0) return false;
++        timeval timeout{2, 0};
++        if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
++            setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
++            close();
++            return false;
++        }
++        sockaddr_un address{};
++        address.sun_family = AF_UNIX;
++        memcpy(address.sun_path + 1, bcmfm::kSocket, sizeof(bcmfm::kSocket) - 1);
++        const socklen_t length = offsetof(sockaddr_un, sun_path) + sizeof(bcmfm::kSocket);
++        ucred peer{};
++        socklen_t peerLength = sizeof(peer);
++        if (connect(fd_, reinterpret_cast<sockaddr*>(&address), length) != 0 ||
++            getsockopt(fd_, SOL_SOCKET, SO_PEERCRED, &peer, &peerLength) != 0 ||
++            peerLength != sizeof(peer) || peer.uid != bcmfm::kServerUid) {
++            __android_log_print(ANDROID_LOG_ERROR, "BcmFm", "FM endpoint unavailable/untrusted");
++            close();
++            return false;
++        }
++        return true;
++    }
++    void close() override {
++        if (fd_ >= 0) ::close(fd_);
++        fd_ = -1;
++    }
++    bool exchange(const bcmfm::Bytes& request, bcmfm::Bytes* response) override {
++        if (fd_ < 0 || !bcmfm::allowed(request.data(), request.size())) return false;
++        ssize_t n;
++        do { n = send(fd_, request.data(), request.size(), MSG_NOSIGNAL); } while (n < 0 && errno == EINTR);
++        if (n != static_cast<ssize_t>(request.size())) {
++            __android_log_print(ANDROID_LOG_ERROR, "BcmFm", "FM endpoint send failed: %s", strerror(errno));
++            close(); return false;
++        }
++        uint8_t buffer[bcmfm::kMaxEvent];
++        do { n = recv(fd_, buffer, sizeof(buffer), MSG_TRUNC); } while (n < 0 && errno == EINTR);
++        if (n <= 0 || static_cast<size_t>(n) > sizeof(buffer)) {
++            __android_log_print(ANDROID_LOG_ERROR, "BcmFm", "FM endpoint closed/timed out, received=%zd", n);
++            close(); return false;
++        }
++        response->assign(buffer, buffer + n);
++        bcmfm::Bytes data;
++        if (!bcmfm::response(request, *response, &data)) {
++            __android_log_print(ANDROID_LOG_ERROR, "BcmFm",
++                    "Incompatible/error FM completion: reg=%02x size=%zd status=%02x echo=%02x/%02x",
++                    request[3], n, n >= 6 ? buffer[5] : 0xff,
++                    n >= 7 ? buffer[6] : 0xff, n >= 8 ? buffer[7] : 0xff);
++            close(); return false;
++        }
++        return true;
++    }
++private:
++    int fd_ = -1;
++};
++class SteadyClock final : public bcmfm::Clock {
++public:
++    int64_t nowMs() override {
++        return std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++    void sleepMs(int ms) override { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
++};
++SocketBus bus;
++SteadyClock clockSource;
++bcmfm::Radio radio(bus, clockSource);
++int khz(jfloat mhz) {
++    if (!std::isfinite(mhz) || mhz < 87.5f || mhz > 108.0f) return -1;
++    const int value = std::lround(mhz * 1000.0);
++    return bcmfm::validFrequency(value) ? value : -1;
++}
++}  // namespace
++
++// The board-specific soname avoids colliding with either the MTK or V4L2 libfmjni.
++#define JNI_METHOD(name) Java_com_android_fmradio_FmNative_##name
++extern "C" {
++JNIEXPORT jboolean JNICALL JNI_METHOD(openDev)(JNIEnv*, jclass) { return JNI_TRUE; }
++JNIEXPORT jboolean JNICALL JNI_METHOD(closeDev)(JNIEnv*, jclass) { radio.powerDown(); return JNI_TRUE; }
++JNIEXPORT jboolean JNICALL JNI_METHOD(powerUp)(JNIEnv*, jclass, jfloat frequency) { return radio.powerUp(khz(frequency)); }
++JNIEXPORT jboolean JNICALL JNI_METHOD(powerDown)(JNIEnv*, jclass, jint type) {
++    return type == 0 && radio.powerDown();
++}
++JNIEXPORT jboolean JNICALL JNI_METHOD(tune)(JNIEnv*, jclass, jfloat frequency) { return radio.tune(khz(frequency)); }
++JNIEXPORT jfloat JNICALL JNI_METHOD(seek)(JNIEnv*, jclass, jfloat frequency, jboolean up) {
++    int value = radio.seek(khz(frequency), up);
++    return value < 0 ? -1.0f : value / 1000.0f;
++}
++JNIEXPORT jshortArray JNICALL JNI_METHOD(autoScan)(JNIEnv* env, jclass) {
++    auto stations = radio.scan();
++    if (stations.empty()) return nullptr;
++    std::vector<jshort> result;
++    for (int value : stations) result.push_back(value / 100); // FMRadio units: 0.1 MHz
++    jshortArray array = env->NewShortArray(result.size());
++    if (array) env->SetShortArrayRegion(array, 0, result.size(), result.data());
++    return array;
++}
++JNIEXPORT jboolean JNICALL JNI_METHOD(stopScan)(JNIEnv*, jclass) { radio.cancel(); return JNI_TRUE; }
++JNIEXPORT jint JNICALL JNI_METHOD(setMute)(JNIEnv*, jclass, jboolean mute) { return radio.mute(mute) ? 1 : -1; }
++JNIEXPORT jboolean JNICALL JNI_METHOD(setBcmVolume)(JNIEnv*, jclass, jint volume) { return radio.volume(volume); }
++JNIEXPORT jboolean JNICALL JNI_METHOD(isBcmPowered)(JNIEnv*, jclass) { return radio.alive(); }
++// Explicitly unsupported in the first hardware candidate; do not advertise RDS
++// or create a polling thread returning fabricated metadata.
++JNIEXPORT jint JNICALL JNI_METHOD(isRdsSupport)(JNIEnv*, jclass) { return 0; }
++JNIEXPORT jint JNICALL JNI_METHOD(setRds)(JNIEnv*, jclass, jboolean) { return -1; }
++JNIEXPORT jshort JNICALL JNI_METHOD(readRds)(JNIEnv*, jclass) { return 0; }
++JNIEXPORT jbyteArray JNICALL JNI_METHOD(getPs)(JNIEnv*, jclass) { return nullptr; }
++JNIEXPORT jbyteArray JNICALL JNI_METHOD(getLrText)(JNIEnv*, jclass) { return nullptr; }
++JNIEXPORT jshort JNICALL JNI_METHOD(activeAf)(JNIEnv*, jclass) { return -1; }
++JNIEXPORT jint JNICALL JNI_METHOD(switchAntenna)(JNIEnv*, jclass, jint antenna) { return antenna == 0 ? 0 : 2; }
++}
+diff --git a/fm/README.md b/fm/README.md
+new file mode 100644
+index 0000000..092e0fd
+--- /dev/null
++++ b/fm/README.md
+@@ -0,0 +1,17 @@
++# A6 Broadcom FM native backend
++
++See `../docs/fm-integration.md` for the full design, source assumptions, build
++steps and hardware caveats. This is an experimental EU-band receiver candidate.
++
++* `BcmFmProtocol.h`: versioned local socket name, exact operation allowlist and
++  controller-response validation. Must match the copy in `system/bt/btif/include`.
++* `BcmFmRadio.*`: serial receiver state machine, tune/readback, seek, scan, cancel,
++  mute and volume. Host-buildable, with no socket dependency; errors go to
++  Android logcat on the device and stderr in host tests.
++* `FmJni.cpp`: authenticated local socket client and FMRadio JNI API. Uses a
++  separate soname; it does not load or copy Samsung's private FM libraries.
++* `tests/`: pure C++ core tests and broker tests with mock Android boundaries.
++
++RDS/AF and recording are deliberately unsupported; native RDS capability is 0.
++The stock kernel's V4L2 radio support remains disabled. No UART/device permissions
++or Broadcom pin-mux writes are added.
+diff --git a/fm/tests/radio_test.cpp b/fm/tests/radio_test.cpp
+new file mode 100644
+index 0000000..21296bb
+--- /dev/null
++++ b/fm/tests/radio_test.cpp
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++#include "BcmFmRadio.h"
++#include <algorithm>
++#include <cassert>
++#include <functional>
++#include <iostream>
++#include <map>
++
++using namespace bcmfm;
++struct FakeClock : Clock {
++    int64_t time = 0;
++    std::function<void(int)> sleepHook;
++    int64_t nowMs() override { return time; }
++    void sleepMs(int ms) override { time += ms; if (sleepHook) sleepHook(ms); }
++};
++struct FakeBus : Bus {
++    bool available = true, opened = false, badEcho = false, noCompletion = false;
++    int opens = 0, closes = 0, failAt = -1, wrongTune = 0, forcedSeek = 0;
++    int flags = 0;
++    std::vector<int> stations{88000, 94500, 101100, 108000};
++    std::map<int, int> registers;
++    std::vector<Bytes> calls;
++    std::function<void()> exchangeHook;
++    bool open() override { ++opens; return opened = available; }
++    void close() override { ++closes; opened = false; }
++    bool exchange(const Bytes& request, Bytes* result) override {
++        assert(allowed(request.data(), request.size()));
++        calls.push_back(request);
++        if (exchangeHook) exchangeHook();
++        if (!opened || !available || static_cast<int>(calls.size()) == failAt) return false;
++        int reg = request[3], mode = request[4];
++        *result = {0x0e, 6, 1, 0x15, 0xfc, 0, static_cast<uint8_t>(reg), static_cast<uint8_t>(mode)};
++        if (badEcho) (*result)[6] ^= 1;
++        if (!mode) {
++            registers[reg] = request.size() == 7 ? le16(request.data() + 5) : request[5];
++            if (reg == 0x09) {
++                flags = 0;
++                if (registers[reg] == 1) {
++                    flags = 1;
++                    if (wrongTune) registers[0x0a] = wrongTune - 64000;
++                }
++                if (registers[reg] == 2) {
++                    int khz = registers[0x0a] + 64000;
++                    int found = -1;
++                    if (forcedSeek) found = forcedSeek;
++                    else if (registers[0x07] & 0x80) {
++                        auto station = std::lower_bound(stations.begin(), stations.end(), khz);
++                        if (station != stations.end()) found = *station;
++                    } else {
++                        auto station = std::upper_bound(stations.begin(), stations.end(), khz);
++                        if (station != stations.begin()) found = *std::prev(station);
++                    }
++                    flags = found < 0 ? 2 : 1;
++                    if (found >= 0) registers[0x0a] = found - 64000;
++                }
++            }
++        } else {
++            int value = reg == 0x12 ? (noCompletion ? 0 : flags) : registers[reg];
++            if (reg == 0x12) flags = 0;
++            result->push_back(value & 255);
++            if (request[5] == 2) result->push_back((value >> 8) & 255);
++            (*result)[1] = result->size() - 2;
++        }
++        return true;
++    }
++    bool wrote(int reg, int value) const {
++        return std::any_of(calls.begin(), calls.end(), [=](const Bytes& b) {
++            return b[3] == reg && b[4] == 0 && (b.size() == 7 ? le16(b.data() + 5) : b[5]) == value;
++        });
++    }
++};
++struct Fixture {
++    FakeClock clock;
++    FakeBus bus;
++    Radio radio{bus, clock};
++};
++int main() {
++    int tests = 0;
++    auto test = [&](const char* name, const std::function<void()>& body) {
++        body(); ++tests; std::cout << "PASS " << name << '\n';
++    };
++    test("EU boundaries and grid", [] {
++        assert(validFrequency(87500)); assert(validFrequency(108000));
++        for (int f : {-1, 0, 76000, 87499, 87550, 108100, 2147483647}) assert(!validFrequency(f));
++    });
++    test("HCI allowlist and framing", [] {
++        const Bytes ok{0x15, 0xfc, 3, 0x00, 0, 1};
++        assert(allowed(ok.data(), ok.size()));
++        for (size_t n = 0; n < ok.size(); ++n) assert(!allowed(ok.data(), n));
++        for (size_t i : {0U, 1U, 2U, 4U, 5U}) {
++            auto bad = ok; bad[i] = 0xff; assert(!allowed(bad.data(), bad.size()));
++        }
++        for (int reg = 0; reg <= 255; ++reg) {
++            Bytes read{0x15, 0xfc, 3, static_cast<uint8_t>(reg), 1, 1};
++            bool expected = reg == 0 || reg == 1 || reg == 0x0f || reg == 0x4d || reg == 0xdf;
++            assert(allowed(read.data(), read.size()) == expected);
++        }
++        for (Bytes bad : {Bytes{0x61, 0xfc, 5, 7, 0x19, 0x18, 0x19, 0x19},
++                         Bytes{0x15, 0xfc, 4, 0xf8, 0, 0, 1},
++                         Bytes{0x15, 0xfc, 3, 0x00, 0, 3},
++                         Bytes{0x15, 0xfc, 3, 0x4d, 0, 0x80},
++                         Bytes{0x15, 0xfc, 3, 0x80, 1, 128}})
++            assert(!allowed(bad.data(), bad.size()));
++    });
++    test("completion validation", [] {
++        Bytes req{0x15, 0xfc, 3, 0x12, 1, 2};
++        Bytes evt{0x0e, 8, 1, 0x15, 0xfc, 0, 0x12, 1, 1, 0}, data;
++        assert(response(req, evt, &data) && data == Bytes({1, 0}));
++        for (size_t i : {0U, 1U, 3U, 4U, 5U, 6U, 7U}) {
++            auto bad = evt; bad[i] ^= 1; assert(!response(req, bad, &data));
++        }
++        for (size_t n = 0; n < evt.size(); ++n) {
++            auto shortEvent = Bytes(evt.begin(), evt.begin() + n);
++            assert(!response(req, shortEvent, &data));
++        }
++        evt.push_back(0); evt[1]++; assert(!response(req, evt, &data));
++    });
++    test("power on sequence and safe initial volume", [] {
++        Fixture f; assert(f.radio.powerUp(100000));
++        assert(f.bus.registers[0] == 1 && f.clock.time == 300);
++        assert(f.bus.wrote(0xf8, 0) && f.bus.wrote(0x05, 0x2f));
++        assert(f.bus.wrote(0x01, 2) && f.bus.wrote(0xfd, 1));
++        assert(f.bus.registers[0x0a] + 64000 == 100000);
++        assert(f.radio.alive());
++        assert(f.radio.powerUp(94500) && f.bus.opens == 1);
++        f.bus.failAt = f.bus.calls.size() + 1;
++        assert(!f.radio.powerUp(101100));
++        assert(f.bus.registers[0x0a] + 64000 == 94500);
++    });
++    test("invalid input never powers or tunes hardware", [] {
++        Fixture f;
++        assert(!f.radio.powerUp(87550) && f.bus.calls.empty());
++        assert(!f.radio.tune(100000) && f.bus.calls.empty());
++        assert(f.radio.seek(100000, true) == -1 && f.bus.calls.empty());
++    });
++    test("unavailable Bluetooth endpoint", [] {
++        Fixture f; f.bus.available = false;
++        assert(!f.radio.powerUp(100000)); assert(f.bus.calls.empty());
++    });
++    test("power-down idempotence", [] {
++        Fixture f; assert(f.radio.powerDown()); assert(f.bus.closes == 0);
++        assert(f.radio.powerUp(100000)); assert(f.radio.powerDown());
++        assert(f.bus.wrote(0, 0) && f.bus.closes == 1);
++        assert(f.radio.powerDown()); assert(f.bus.closes == 1);
++        assert(!f.radio.alive());
++    });
++    test("every power-on I/O failure rolls back", [] {
++        Fixture good; assert(good.radio.powerUp(100000));
++        const int operations = good.bus.calls.size();
++        for (int i = 1; i <= operations; ++i) {
++            Fixture f; f.bus.failAt = i;
++            assert(!f.radio.powerUp(100000));
++            assert(!f.bus.opened && f.bus.wrote(0, 0));
++            assert(!f.radio.alive());
++        }
++    });
++    test("bad echo fails closed", [] {
++        Fixture f; f.bus.badEcho = true;
++        assert(!f.radio.powerUp(100000)); assert(!f.bus.opened && f.bus.wrote(0, 0));
++    });
++    test("does not steal FM-over-SCO", [] {
++        Fixture f; f.bus.registers[0x4d] = 0x80;
++        assert(!f.radio.powerUp(100000)); assert(f.bus.registers[0x4d] == 0x80);
++    });
++    test("mute and digital volume bounds", [] {
++        Fixture f; assert(f.radio.powerUp(100000));
++        assert(f.radio.mute(false) && f.bus.registers[5] == 0x2d);
++        assert(f.radio.mute(true) && f.bus.registers[5] == 0x2f);
++        assert(f.radio.volume(0)); assert(f.radio.volume(128)); assert(f.radio.volume(255));
++        size_t n = f.bus.calls.size();
++        assert(!f.radio.volume(-1) && !f.radio.volume(256)); assert(f.bus.calls.size() == n);
++    });
++    test("tune and readback", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); assert(f.radio.tune(94500));
++        assert(f.bus.registers[0x0a] == 30500);
++        assert(!f.radio.tune(94550)); assert(f.bus.registers[0x0a] == 30500);
++    });
++    test("mismatched tune readback never succeeds", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.wrongTune = 101100;
++        assert(!f.radio.tune(94500)); assert(!f.radio.alive());
++    });
++    test("seek both directions excludes current channel", [] {
++        Fixture f; assert(f.radio.powerUp(94500));
++        assert(f.radio.seek(94500, true) == 101100);
++        assert(f.radio.seek(101100, false) == 94500);
++    });
++    test("seek wraps at band boundaries", [] {
++        Fixture f; assert(f.radio.powerUp(108000));
++        assert(f.radio.seek(108000, true) == 88000);
++        assert(f.radio.seek(87500, false) == 108000);
++    });
++    test("seek wraps only on explicit band-limit response", [] {
++        Fixture f; f.bus.stations = {88000}; assert(f.radio.powerUp(100000));
++        assert(f.radio.seek(100000, true) == 88000);
++    });
++    test("no station returns failure and restores tune", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.stations.clear();
++        assert(f.radio.seek(100000, true) == -1);
++        assert(f.bus.registers[0x0a] + 64000 == 100000);
++    });
++    test("scan sorted and restores original station", [] {
++        Fixture f; assert(f.radio.powerUp(100000));
++        assert(f.radio.scan() == f.bus.stations);
++        assert(f.bus.registers[0x0a] + 64000 == 100000);
++    });
++    test("implicit firmware seek wrap cannot loop forever", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.forcedSeek = 88000;
++        assert(f.radio.scan() == std::vector<int>{88000});
++        assert(f.clock.time < 1000);
++    });
++    test("power-up cancellation rolls back", [] {
++        Fixture f; f.clock.sleepHook = [&](int) { f.radio.cancel(); };
++        assert(!f.radio.powerUp(100000)); assert(f.bus.wrote(0, 0) && !f.bus.opened);
++        for (size_t at = 1; at <= 11; ++at) {
++            Fixture mid;
++            mid.bus.exchangeHook = [&] { if (mid.bus.calls.size() == at) mid.radio.cancel(); };
++            assert(!mid.radio.powerUp(100000));
++            assert(mid.bus.calls.size() == at + 2); // only mute and OFF after cancellation
++            assert(mid.bus.registers[0] == 0 && !mid.bus.opened);
++        }
++    });
++    test("seek cancellation interrupts the poll and restores", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.noCompletion = true;
++        f.clock.sleepHook = [&](int) { f.radio.cancel(); f.bus.noCompletion = false; };
++        assert(f.radio.seek(100000, true) == -1);
++        assert(f.bus.registers[0x0a] + 64000 == 100000);
++        assert(f.clock.time < 1000);
++    });
++    test("scan cancellation discards partial stations", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.noCompletion = true;
++        f.clock.sleepHook = [&](int) { f.radio.cancel(); f.bus.noCompletion = false; };
++        assert(f.radio.scan().empty()); assert(f.clock.time < 1000);
++    });
++    test("timeout is bounded and powers down if restoration also fails", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.noCompletion = true;
++        assert(f.radio.seek(100000, true) == -1);
++        assert(f.clock.time <= 22500); assert(!f.radio.alive());
++    });
++    test("link loss health check clears local state", [] {
++        Fixture f; assert(f.radio.powerUp(100000)); f.bus.available = false;
++        assert(!f.radio.alive()); assert(!f.bus.opened);
++        assert(!f.radio.tune(94500));
++    });
++    std::cout << tests << " native tests passed\n";
++}
+diff --git a/fm/tests/run_host_tests.py b/fm/tests/run_host_tests.py
+new file mode 100644
+index 0000000..92b4cec
+--- /dev/null
++++ b/fm/tests/run_host_tests.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++"""Linux host tests. Android HCI/audio/peer-credential APIs are mocked in broker tests.
++
++These tests do not build Android, compile SELinux policy, or verify hardware.
++Never run the socket-broker test executable on a phone.
++"""
++import argparse
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--bt-tree", type=Path, help="patched system/bt source tree")
++    parser.add_argument("--sanitize", action="store_true", help="enable ASan and UBSan")
++    args = parser.parse_args()
++    if os.environ.get("ANDROID_ROOT"):
++        parser.error("host-only test: do not run the mock Bluetooth endpoint on Android")
++    tests = Path(__file__).resolve().parent
++    source = tests.parent
++    flags = ["-std=c++17", "-Wall", "-Wextra", "-Werror", "-pthread"]
++    if args.sanitize:
++        flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
++    with tempfile.TemporaryDirectory(prefix="bcm-fm-host-") as directory:
++        binary = str(Path(directory) / "radio-test")
++        subprocess.run(["g++", *flags, "-I" + str(source), str(source / "BcmFmRadio.cpp"),
++                        str(tests / "radio_test.cpp"), "-o", binary], check=True)
++        subprocess.run([binary], check=True)
++        if args.bt_tree:
++            bt = args.bt_tree.resolve()
++            header = bt / "btif/include/BcmFmProtocol.h"
++            if header.read_bytes() != (source / "BcmFmProtocol.h").read_bytes():
++                parser.error("device and Bluetooth protocol headers differ")
++            implementation = bt / "btif/src/btif_bcm_fm.cc"
++            if '"' in str(implementation):
++                parser.error("source path cannot contain quotes")
++            binary = str(Path(directory) / "broker-test")
++            subprocess.run(["g++", *flags, "-I" + str(tests / "stack_stubs"),
++                            "-I" + str(bt / "btif/include"),
++                            '-DBCM_FM_SERVER_SOURCE="' + str(implementation) + '"',
++                            str(tests / "server_test.cpp"), "-o", binary], check=True)
++            subprocess.run([binary], check=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/fm/tests/server_test.cpp b/fm/tests/server_test.cpp
+new file mode 100644
+index 0000000..f5cbb4e
+--- /dev/null
++++ b/fm/tests/server_test.cpp
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2026 The LineageOS Project
++// Real broker/socket/thread implementation; only Android HCI, audio and peer UID
++// boundaries are mocked. Never run this executable on a phone.
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <atomic>
++#include <cassert>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <thread>
++#include <vector>
++#include <iostream>
++#include <functional>
++#include "hci_layer.h"
++#include "osi/include/allocator.h"
++
++std::atomic<int> audioStops{0}, transmissions{0}, behavior{0};
++std::atomic<bool> authorized{true};
++std::mutex callbackMutex;
++std::vector<std::thread> callbacks;
++int peerOption(int fd, int level, int name, void* value, socklen_t* length) {
++    int result = getsockopt(fd, level, name, value, length);
++    if (!result && level == SOL_SOCKET && name == SO_PEERCRED)
++        static_cast<ucred*>(value)->uid = authorized ? 1000 : 12345;
++    return result;
++}
++#define getsockopt peerOption
++#include BCM_FM_SERVER_SOURCE
++#undef getsockopt
++
++void transmit(BT_HDR* command, Complete complete, Status status, void* token) {
++    ++transmissions;
++    const int mode = behavior.load();
++    std::lock_guard<std::mutex> lock(callbackMutex);
++    callbacks.emplace_back([=] {
++        std::this_thread::sleep_for(std::chrono::milliseconds(mode == 1 ? 1750 : 10));
++        if (mode == 2) { status(0x0c, command, token); return; }
++        auto* event = static_cast<BT_HDR*>(osi_calloc(sizeof(BT_HDR) + 8));
++        event->len = 8;
++        const uint8_t bytes[] = {0x0e, 6, 1, 0x15, 0xfc, 0, command->data[3], command->data[4]};
++        memcpy(event->data, bytes, sizeof(bytes));
++        complete(event, token);  // callback owns event
++        osi_free(command);       // HCI owns command on Command Complete
++    });
++}
++const hci_t* hci_layer_get_interface() { static const hci_t hci{transmit}; return &hci; }
++void drain() {
++    std::vector<std::thread> copy;
++    { std::lock_guard<std::mutex> lock(callbackMutex); copy.swap(callbacks); }
++    for (auto& t : copy) t.join();
++}
++int connectClient() {
++    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++    assert(fd >= 0);
++    timeval timeout{3, 0};
++    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
++    sockaddr_un address{}; address.sun_family = AF_UNIX;
++    memcpy(address.sun_path + 1, bcmfm::kSocket, sizeof(bcmfm::kSocket) - 1);
++    assert(connect(fd, reinterpret_cast<sockaddr*>(&address),
++                   offsetof(sockaddr_un, sun_path) + sizeof(bcmfm::kSocket)) == 0);
++    return fd;
++}
++void waitFor(const std::function<bool()>& predicate) {
++    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++    while (!predicate() && std::chrono::steady_clock::now() < end)
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    assert(predicate());
++}
++int request(int fd, const std::vector<uint8_t>& bytes) {
++    ssize_t n = send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
++    if (n < 0) return -1;
++    uint8_t reply[32];
++    n = recv(fd, reply, sizeof(reply), 0);
++    if (n > 0) assert(n == 8 && reply[0] == 0x0e && reply[5] == 0);
++    return n;
++}
++int main() {
++    const std::vector<uint8_t> on{0x15, 0xfc, 3, 0, 0, 1};
++    btif_bcm_fm_start();
++    btif_bcm_fm_start();  // idempotent, doesn't replace the active socket/thread
++    int client = connectClient();
++    assert(request(client, on) == 8);
++    int other = connectClient();
++    assert(request(other, on) <= 0); close(other);
++    assert(request(client, on) == 8);  // rejected second client can't shut first down
++    int count = transmissions;
++    close(client);
++    waitFor([&] { return audioStops == 1; });
++    assert(transmissions == count + 1); // client death submitted FM OFF
++    std::cout << "PASS session exclusivity and client-death shutdown\n";
++
++    authorized = false;
++    client = connectClient(); count = transmissions;
++    assert(request(client, on) <= 0); close(client);
++    assert(transmissions == count);
++    authorized = true;
++    std::cout << "PASS unauthorized UID rejected before HCI\n";
++
++    client = connectClient(); count = transmissions;
++    // Controller reset / arbitrary vendor opcodes must not enter the HCI queue.
++    assert(request(client, {3, 12, 0}) <= 0); close(client);
++    waitFor([&] { return audioStops == 2; });
++    assert(transmissions == count + 1); // only cleanup OFF, never the bad command
++    std::cout << "PASS malformed/opcode request rejected\n";
++    btif_bcm_fm_stop(); drain();
++
++    btif_bcm_fm_start();
++    behavior = 1; client = connectClient();
++    assert(request(client, on) <= 0); // 1.5s deadline, later callback still owns packet
++    close(client); btif_bcm_fm_stop();
++    // New adapter epoch before the previous epoch's delayed completion arrives.
++    behavior = 0; btif_bcm_fm_start();
++    client = connectClient(); assert(request(client, on) == 8);
++    drain();
++    assert(request(client, on) == 8);
++    close(client); btif_bcm_fm_stop(); drain();
++    std::cout << "PASS timeout, late callback and adapter restart\n";
++
++    behavior = 2; btif_bcm_fm_start(); client = connectClient();
++    assert(request(client, on) <= 0);
++    close(client); btif_bcm_fm_stop(); drain();
++    std::cout << "PASS Command Status failure and ownership cleanup\n";
++
++    behavior = 1; btif_bcm_fm_start(); client = connectClient();
++    count = transmissions;
++    assert(send(client, on.data(), on.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(on.size()));
++    waitFor([&] { return transmissions > count; });
++    auto start = std::chrono::steady_clock::now();
++    btif_bcm_fm_stop();
++    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(1));
++    close(client); drain(); btif_bcm_fm_stop();
++    std::cout << "PASS adapter shutdown unblocks an outstanding request\n";
++}
+diff --git a/fm/tests/stack_stubs/bt_target.h b/fm/tests/stack_stubs/bt_target.h
+new file mode 100644
+index 0000000..5b760ae
+--- /dev/null
++++ b/fm/tests/stack_stubs/bt_target.h
+@@ -0,0 +1,4 @@
++// Host-only mock of the board-selection boundary, not an Android header.
++#pragma once
++#define TRUE 1
++#define BRCM_FM_HCI_INCLUDED TRUE
+diff --git a/fm/tests/stack_stubs/hci_layer.h b/fm/tests/stack_stubs/hci_layer.h
+new file mode 100644
+index 0000000..db5b81d
+--- /dev/null
++++ b/fm/tests/stack_stubs/hci_layer.h
+@@ -0,0 +1,8 @@
++// Host-only model of the three hci_layer.h entry points used by the broker.
++#pragma once
++#include <cstdint>
++struct BT_HDR { uint16_t event, len, offset, layer_specific; uint8_t data[]; };
++using Complete = void (*)(BT_HDR*, void*);
++using Status = void (*)(uint8_t, BT_HDR*, void*);
++struct hci_t { void (*transmit_command)(BT_HDR*, Complete, Status, void*); };
++const hci_t* hci_layer_get_interface();
+diff --git a/fm/tests/stack_stubs/media/AudioSystem.h b/fm/tests/stack_stubs/media/AudioSystem.h
+new file mode 100644
+index 0000000..f392f3f
+--- /dev/null
++++ b/fm/tests/stack_stubs/media/AudioSystem.h
+@@ -0,0 +1,15 @@
++// Host mock: record route shutdowns; this is NOT an audio HAL test.
++#pragma once
++#include <atomic>
++#include <cassert>
++#include <utils/String8.h>
++extern std::atomic<int> audioStops;
++namespace android {
++struct AudioSystem {
++    static int setParameters(int output, const String8& value) {
++        assert(output == 0 && value == "l_fmradio_mode=off");
++        ++audioStops;
++        return 0;
++    }
++};
++}
+diff --git a/fm/tests/stack_stubs/osi/include/allocator.h b/fm/tests/stack_stubs/osi/include/allocator.h
+new file mode 100644
+index 0000000..a822b02
+--- /dev/null
++++ b/fm/tests/stack_stubs/osi/include/allocator.h
+@@ -0,0 +1,4 @@
++#pragma once
++#include <cstdlib>
++inline void* osi_calloc(size_t n) { void* p = std::calloc(1, n); if (!p) std::abort(); return p; }
++inline void osi_free(void* p) { std::free(p); }
+diff --git a/fm/tests/stack_stubs/osi/include/log.h b/fm/tests/stack_stubs/osi/include/log.h
+new file mode 100644
+index 0000000..06f94d2
+--- /dev/null
++++ b/fm/tests/stack_stubs/osi/include/log.h
+@@ -0,0 +1,4 @@
++#pragma once
++#include <cstdio>
++#define LOG_ERROR(tag, format, ...) std::fprintf(stderr, tag ": " format "\n", ##__VA_ARGS__)
++#define LOG_INFO(tag, format, ...) std::fprintf(stderr, tag ": " format "\n", ##__VA_ARGS__)
+diff --git a/fm/tests/stack_stubs/utils/String8.h b/fm/tests/stack_stubs/utils/String8.h
+new file mode 100644
+index 0000000..07b1c91
+--- /dev/null
++++ b/fm/tests/stack_stubs/utils/String8.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <string>
++namespace android { using String8 = std::string; }
+diff --git a/lineage.dependencies b/lineage.dependencies
+index e450f4a..606c3a2 100644
+--- a/lineage.dependencies
++++ b/lineage.dependencies
+@@ -2,5 +2,10 @@
+     {
+         "repository": "android_device_samsung_universal7870-common",
+         "target_path": "device/samsung/universal7870-common"
++    },
++    {
++        "repository": "android_packages_apps_FMRadio",
++        "target_path": "packages/apps/FMRadio",
++        "branch": "lineage-18.1"
+     }
+ ]
+diff --git a/overlay/packages/apps/FMRadio/res/values/config.xml b/overlay/packages/apps/FMRadio/res/values/config.xml
+new file mode 100644
+index 0000000..214b2bd
+--- /dev/null
++++ b/overlay/packages/apps/FMRadio/res/values/config.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<resources>
++    <bool name="config_bcmHciFm">true</bool>
++</resources>
+diff --git a/sepolicy/fmradio.te b/sepolicy/fmradio.te
+new file mode 100644
+index 0000000..dc556a4
+--- /dev/null
++++ b/sepolicy/fmradio.te
+@@ -0,0 +1,4 @@
++# Platform-signed FMRadio shares android.uid.system (system_app). The endpoint
++# lives in Bluetooth's process and also checks UID plus a register allowlist.
++# Abstract socket: no filesystem socket, UART, radio device or vendor HAL grant.
++allow system_app bluetooth:unix_stream_socket connectto;

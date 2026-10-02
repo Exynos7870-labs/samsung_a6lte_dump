@@ -1,0 +1,27 @@
+{
+  "dump_commit": "59c75738f83f4307f18f41b80cf2b578dad9ff51",
+  "fingerprint": "samsung/a6ltexx/a6lte:10/QP1A.190711.020/A600FNXXU9CVB1:user/release-keys",
+  "kernel_config": [
+    "CONFIG_BT_BCM43XX=y",
+    "CONFIG_BCM43456=y",
+    "# CONFIG_MEDIA_RADIO_SUPPORT is not set",
+    "# CONFIG_FM_SI47XX is not set"
+  ],
+  "sha256": {
+    "boot/kernel": "c01ca7044cc77908e58ae886f8ffed8e7d6641c56328cf6449d6eb71f7ede428",
+    "vendor/firmware/bcm4345C5_V0069.0172.hcd": "fe5d61771d2e26310f295ee7241b5d188b80d80d3b6805f4a6452d52783a2225",
+    "vendor/etc/floating_feature.xml": "4a84cfc4c9dc0eec61f7410a627ba38a7d14aa8fbf7c6735799ef4471f8ad336",
+    "system/system/lib/libbluetooth.so": "0501dafd787573c1c8ce72a0edc2fe96da26334ae9abdf4d7055e5136503f962",
+    "system/system/lib/libbluetooth_jni.so": "b72cbf45c468006b193fdece38ee961eb4abbc0253831d39d16724487002dd82",
+    "vendor/lib/hw/audio.primary.exynos7870.so": "4dc81a0c1388820e01dd3f3dc9853fc63447e347e298de5866b44fc708b6615d",
+    "vendor/etc/mixer_paths.xml": "efe00124a761798197d516d402d89fe6d8c508ff56528acf2fbd20be57cb5999",
+    "vendor/etc/mixer_gains.xml": "20933733a55e20dfe39e717d7f20030574af5dfe26688b79ba3af38edd329e2c"
+  },
+  "current_vendor_firmware": {
+    "repository": "samsungexynos7870/android_vendor_samsung_a6lte",
+    "commit": "f0c55d795a9be60147d76a42ec93fd9ba3e5800f",
+    "path": "proprietary/vendor/firmware/bcm4345C5_V0069.0172.hcd",
+    "sha256": "fe5d61771d2e26310f295ee7241b5d188b80d80d3b6805f4a6452d52783a2225",
+    "matches_stock_dump": true
+  }
+}

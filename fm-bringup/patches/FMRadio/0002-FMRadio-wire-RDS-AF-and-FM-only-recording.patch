@@ -1,0 +1,1333 @@
+From c8a1d59e016e5e7314e1baf3cef2950d156c79a9 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH] FMRadio: wire RDS/AF and FM-only recording
+
+Serialize BCM metadata polling with tuner operations; update station
+database, UI and notifications using decoded UTF-8 PS/RadioText. Do not
+probe AF while recording or override queued user station selections.
+Enable recording through an explicit, verified FM-tuner AudioRecord,
+feeding the existing AAC/file workflow without duplicating playback.
+Reject microphone fallback, route changes and read failures; stop on
+focus, Bluetooth, headset and service teardown. Add host capture tests.
+
+HAL routing and encoded recordings require A6 hardware validation.
+---
+ AndroidManifest.xml                           |   2 +
+ res/values/bcm_fm_strings.xml                 |   1 +
+ src/com/android/fmradio/AudioRecorder.java    | 199 +++++++++++-------
+ src/com/android/fmradio/BcmFmAudio.java       |   2 +-
+ src/com/android/fmradio/BcmFmCapture.java     | 119 +++++++++++
+ src/com/android/fmradio/FmMainActivity.java   |   4 -
+ src/com/android/fmradio/FmService.java        | 142 ++++++++++++-
+ .../android/media/AudioDeviceInfo.java        |   8 +
+ tests/capture/android/media/AudioFormat.java  |  13 ++
+ tests/capture/android/media/AudioManager.java |  10 +
+ tests/capture/android/media/AudioRecord.java  |  32 +++
+ .../capture/android/media/MediaRecorder.java  |   4 +
+ tests/capture/android/os/Process.java         |   4 +
+ tests/capture/android/os/SystemClock.java     |   7 +
+ tests/capture/android/util/Log.java           |  11 +
+ .../com/android/fmradio/CaptureTest.java      |  58 +++++
+ tests/encoder/android/media/MediaCodec.java   |  38 ++++
+ .../encoder/android/media/MediaCodecInfo.java |   4 +
+ tests/encoder/android/media/MediaFormat.java  |   8 +
+ tests/encoder/android/media/MediaMuxer.java   |  18 ++
+ tests/encoder/android/os/Handler.java         |  12 ++
+ tests/encoder/android/os/HandlerThread.java   |  10 +
+ tests/encoder/android/os/Looper.java          |  13 ++
+ tests/encoder/android/os/Message.java         |   4 +
+ .../com/android/fmradio/EncoderTest.java      |  53 +++++
+ tests/run_capture_tests.py                    |  21 ++
+ 26 files changed, 707 insertions(+), 90 deletions(-)
+ create mode 100644 src/com/android/fmradio/BcmFmCapture.java
+ create mode 100644 tests/capture/android/media/AudioDeviceInfo.java
+ create mode 100644 tests/capture/android/media/AudioFormat.java
+ create mode 100644 tests/capture/android/media/AudioManager.java
+ create mode 100644 tests/capture/android/media/AudioRecord.java
+ create mode 100644 tests/capture/android/media/MediaRecorder.java
+ create mode 100644 tests/capture/android/os/Process.java
+ create mode 100644 tests/capture/android/os/SystemClock.java
+ create mode 100644 tests/capture/android/util/Log.java
+ create mode 100644 tests/capture/com/android/fmradio/CaptureTest.java
+ create mode 100644 tests/encoder/android/media/MediaCodec.java
+ create mode 100644 tests/encoder/android/media/MediaCodecInfo.java
+ create mode 100644 tests/encoder/android/media/MediaFormat.java
+ create mode 100644 tests/encoder/android/media/MediaMuxer.java
+ create mode 100644 tests/encoder/android/os/Handler.java
+ create mode 100644 tests/encoder/android/os/HandlerThread.java
+ create mode 100644 tests/encoder/android/os/Looper.java
+ create mode 100644 tests/encoder/android/os/Message.java
+ create mode 100644 tests/encoder/com/android/fmradio/EncoderTest.java
+ create mode 100644 tests/run_capture_tests.py
+
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index 71a56e0..b3d0a6d 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -37,6 +37,8 @@
+     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+     <uses-permission android:name="android.permission.MOUNT_UNMOUNT_FILESYSTEMS" />
+     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
++    <!-- Signature permission for the explicit RADIO_TUNER capture source. -->
++    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" />
+     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     <uses-permission android:name="android.permission.WAKE_LOCK" />
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+diff --git a/res/values/bcm_fm_strings.xml b/res/values/bcm_fm_strings.xml
+index 980f6da..ca8e5ac 100644
+--- a/res/values/bcm_fm_strings.xml
++++ b/res/values/bcm_fm_strings.xml
+@@ -3,4 +3,5 @@
+ <resources>
+     <string name="bcm_fm_enable_bluetooth">Enable Bluetooth before using FM radio. Wired headphones are required as the antenna.</string>
+     <string name="bcm_fm_failed">FM radio is unavailable. This experimental backend needs device testing; check the BcmFm and bt_bcm_fm logs.</string>
++    <string name="bcm_fm_capture_failed">FM recording is unavailable. Check recording permission and the FM tuner input. Microphone fallback is disabled.</string>
+ </resources>
+diff --git a/src/com/android/fmradio/AudioRecorder.java b/src/com/android/fmradio/AudioRecorder.java
+index a779abb..85b6181 100644
+--- a/src/com/android/fmradio/AudioRecorder.java
++++ b/src/com/android/fmradio/AudioRecorder.java
+@@ -32,6 +32,8 @@ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.LinkedList;
+ import java.util.concurrent.Semaphore;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ class AudioRecorder extends HandlerThread implements Handler.Callback {
+     public static final int AUDIO_RECORDER_ERROR_INTERNAL = -100;
+@@ -51,20 +53,27 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+     private LinkedList<Sample> mQueue = new LinkedList<>();
+     private MediaFormat mOutFormat;
+     private int mMuxerTrack;
+-    private float mRate; // bytes per us
++    private double mRate;
++    private int mFrameBytes; // bytes per us
+     private long mInputBufferPosition;
+     private int mInputBufferIndex = -1;
+     /** This semaphore is initialized when stopRecording() is called and blocks
+         until recording is stopped. */
+     private Semaphore mFinalSem;
+-    private boolean mFinished;
++    private volatile boolean mFinished;
++    private boolean mReleased, mMuxerStarted, mInputEos, mDiskWarning;
++    private final LinkedList<Integer> mInputs = new LinkedList<>();
++    private final AtomicInteger mPendingBytes = new AtomicInteger();
++    private final AtomicInteger mPendingError = new AtomicInteger();
++    private static final int MAX_PENDING_BYTES = 1024 * 1024;
+     private Handler mCallbackHandler;
+-    private Callback mCallback;
++    private volatile Callback mCallback;
+ 
+     AudioRecorder(AudioFormat format, File filePath) {
+         super("AudioRecorder Thread");
+         mFilePath = filePath;
+         mInputFormat = format;
++        mCallbackHandler = new Handler(Looper.getMainLooper());
+ 
+         start();
+ 
+@@ -74,7 +83,7 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+ 
+     public void setCallback(Callback callback) {
+         mCallback = callback;
+-        mCallbackHandler = new Handler(Looper.getMainLooper());
++        deliverError(); // initialization may fail before setCallback is called
+     }
+ 
+     /**
+@@ -82,11 +91,17 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+      *
+      * @param bytes - PCM inbut buffer
+      */
+-    public void encode(byte[] bytes) {
++    public synchronized void encode(byte[] bytes) {
+         if (mFinished) {
+             Log.w(TAG, "encode() called after stopped");
+             return;
+         }
++        if (bytes.length > MAX_PENDING_BYTES - mPendingBytes.get()) {
++            mFinished = true;
++            mHandler.post(() -> onError("encoder input backlog exceeded 1 MiB", null));
++            return;
++        }
++        mPendingBytes.addAndGet(bytes.length);
+         Sample s = new Sample();
+         s.bytes = bytes;
+         mHandler.obtainMessage(MSG_ENCODE, s).sendToTarget();
+@@ -97,23 +112,21 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+      * Blocks until the recording finishes cleanly.
+      */
+     public void stopRecording() {
+-        if (mFinished) {
+-            Log.w(TAG, "stopRecording() called after stopped");
+-            return;
+-        }
+-
+-        mFinished = true;
+-        Log.d(TAG, "Stopping");
+         Semaphore done = new Semaphore(0);
+-        mHandler.obtainMessage(MSG_STOP, done).sendToTarget();
+-
++        synchronized (this) {
++            if (mFinished) return;
++            mFinished = true;
++            mHandler.obtainMessage(MSG_STOP, done).sendToTarget();
++        }
+         try {
+-            // block until done
+-            done.acquire();
++            if (!done.tryAcquire(3, TimeUnit.SECONDS)) {
++                mHandler.post(() -> onError("encoder EOS timeout", null));
++                mPendingError.set(AUDIO_RECORDER_ERROR_INTERNAL);
++                deliverError();
++            }
+         } catch (InterruptedException ex) {
+-            Log.e(TAG, "interrupted waiting for encoding to finish", ex);
+-        } finally {
+-            quitSafely();
++            Thread.currentThread().interrupt();
++            mHandler.post(() -> onError("encoder stop interrupted", ex));
+         }
+     }
+ 
+@@ -145,29 +158,32 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+             return;
+         }
+ 
+-        mOutFormat = mCodec.getOutputFormat();
+-        mMuxerTrack = mMuxer.addTrack(mOutFormat);
+-        mMuxer.start();
++        // AAC codec-specific data becomes available in onOutputFormatChanged.
++        // Starting the muxer here can create an invalid M4A track without CSD.
+     }
+ 
+     @Override
+     public boolean handleMessage(Message msg) {
+-        if (msg.what == MSG_INIT) {
+-            init();
+-        } else if (msg.what == MSG_STOP) {
+-            mFinalSem = (Semaphore) msg.obj;
+-            if (mInputBufferIndex >= 0) {
+-                processInputBuffer();
+-            }
+-        } else if (msg.what == MSG_ENCODE) {
+-            mQueue.addLast((Sample) msg.obj);
+-            if (mInputBufferIndex >= 0) {
+-                processInputBuffer();
+-            }
++        if (mReleased) {
++            if (msg.what == MSG_STOP) ((Semaphore) msg.obj).release();
++            return true;
+         }
++        try {
++            if (msg.what == MSG_INIT) init();
++            else if (msg.what == MSG_STOP) { mFinalSem = (Semaphore) msg.obj; drainInputs(); }
++            else if (msg.what == MSG_ENCODE) { mQueue.addLast((Sample) msg.obj); drainInputs(); }
++        } catch (RuntimeException error) { onError("encoder handler failed", error); }
+         return true;
+     }
+ 
++    private void drainInputs() {
++        while (!mReleased && !mInputEos && !mInputs.isEmpty()
++                && (!mQueue.isEmpty() || mFinalSem != null)) {
++            mInputBufferIndex = mInputs.removeFirst();
++            processInputBuffer();
++        }
++    }
++
+     private void processInputBuffer() {
+         Sample s = mQueue.peekFirst();
+         if (s == null) { // input available?
+@@ -179,13 +195,18 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+                         mInputBufferIndex, 0, 0,
+                         getPresentationTimestampUs(mInputBufferPosition),
+                         MediaCodec.BUFFER_FLAG_END_OF_STREAM);
++                mInputEos = true;
++                mInputBufferIndex = -1;
+             }
+             return;
+         }
+ 
+         ByteBuffer b = mCodec.getInputBuffer(mInputBufferIndex);
+-        assert b != null;
++        if (b == null) throw new IllegalStateException("missing codec input buffer");
++        b.clear();
+         int sz = Math.min(b.capacity(), s.bytes.length - s.offset);
++        sz -= sz % mFrameBytes;
++        if (sz <= 0) throw new IllegalStateException("unaligned PCM sample or undersized codec buffer");
+         long ts = getPresentationTimestampUs(mInputBufferPosition);
+         if (TRACE)
+             Log.v(TAG, String.format("processInputBuffer (len=%d) ts=%.3f", sz, ts * 1e-6));
+@@ -193,6 +214,7 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+         b.put(s.bytes, s.offset, sz);
+         mCodec.queueInputBuffer(mInputBufferIndex, 0, sz, ts, 0);
+ 
++        mPendingBytes.addAndGet(-sz);
+         mInputBufferPosition += sz;
+         s.offset += sz;
+ 
+@@ -207,13 +229,17 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+ 
+     private void processOutputBuffer(int index, MediaCodec.BufferInfo info) {
+         ByteBuffer outputBuffer = mCodec.getOutputBuffer(index);
+-        assert outputBuffer != null;
+-
+         if (TRACE)
+             Log.v(TAG, String.format("processOutputBuffer (len=%d) ts=%.3f",
+-                    outputBuffer.limit(), info.presentationTimeUs * 1e-6));
+-
+-        mMuxer.writeSampleData(mMuxerTrack, outputBuffer, info);
++                    info.size, info.presentationTimeUs * 1e-6));
++
++        if (info.size > 0 && (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
++            if (!mMuxerStarted || outputBuffer == null)
++                throw new IllegalStateException("AAC output arrived before format");
++            outputBuffer.position(info.offset);
++            outputBuffer.limit(info.offset + info.size);
++            mMuxer.writeSampleData(mMuxerTrack, outputBuffer, info);
++        }
+         mCodec.releaseOutputBuffer(index, false);
+         if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+             Log.d(TAG, "Output EOS");
+@@ -223,48 +249,58 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+         }
+     }
+ 
+-    private void onDiskLow() {
+-        mCallbackHandler.post(new Runnable() {
+-            @Override
+-            public void run() {
+-                if (mCallback != null) {
+-                    mCallback.onError(AUDIO_RECORDER_WARN_DISK_LOW);
+-                }
++    private void deliverError() {
++        mCallbackHandler.post(() -> {
++            Callback callback = mCallback;
++            if (callback != null) {
++                int error = mPendingError.getAndSet(0);
++                if (error != 0) callback.onError(error);
+             }
+         });
+     }
+ 
+-    private void onError(String s, Exception e) {
+-        Log.e(TAG, s, e);
+-        mFinished = true;
+-        stopAndRelease();
+-        mCallbackHandler.post(new Runnable() {
+-            @Override
+-            public void run() {
+-                quitSafely();
+-                if (mCallback != null) {
+-                    mCallback.onError(AUDIO_RECORDER_ERROR_INTERNAL);
+-                }
+-            }
+-        });
++    private void onDiskLow() {
++        if (mDiskWarning) return;
++        mDiskWarning = true;
++        mPendingError.set(AUDIO_RECORDER_WARN_DISK_LOW);
++        deliverError();
+     }
+ 
+-    private void finish() {
+-        assert mFinalSem != null;
++    private void onError(String message, Exception error) {
++        Log.e(TAG, message, error);
++        mPendingError.set(AUDIO_RECORDER_ERROR_INTERNAL);
++        mFinished = true;
+         stopAndRelease();
+-        mFinalSem.release();
++        deliverError();
+     }
+ 
+-    private void stopAndRelease() {
+-        // can fail early on before codec/muxer are created
+-        if (mCodec != null) {
+-            mCodec.stop();
+-            mCodec.release();
+-        }
++    private void finish() { stopAndRelease(); }
+ 
+-        if (mMuxer != null) {
+-            mMuxer.stop();
+-            mMuxer.release();
++    private void stopAndRelease() {
++        if (mReleased) return;
++        mReleased = true;
++        mFinished = true;
++        try {
++            if (mCodec != null) {
++                try { mCodec.stop(); } catch (RuntimeException error) { Log.w(TAG, "codec stop", error); }
++                try { mCodec.release(); } catch (RuntimeException error) { Log.w(TAG, "codec release", error); }
++                mCodec = null;
++            }
++            if (mMuxer != null) {
++                try {
++                    if (mMuxerStarted) mMuxer.stop();
++                } catch (RuntimeException error) {
++                    mPendingError.set(AUDIO_RECORDER_ERROR_INTERNAL);
++                    deliverError();
++                    Log.e(TAG, "M4A finalization failed", error);
++                }
++                try { mMuxer.release(); } catch (RuntimeException error) { Log.w(TAG, "muxer release", error); }
++                mMuxer = null;
++            }
++        } finally {
++            mQueue.clear(); mInputs.clear(); mPendingBytes.set(0);
++            if (mFinalSem != null) { mFinalSem.release(); mFinalSem = null; }
++            quitSafely();
+         }
+     }
+ 
+@@ -284,6 +320,7 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+                 throw new IllegalArgumentException("Unexpected encoding: " + mInputFormat.getEncoding());
+         }
+ 
++        mFrameBytes = bits_per_sample / 8 * mInputFormat.getChannelCount();
+         mRate = bits_per_sample;
+         mRate *= mInputFormat.getSampleRate();
+         mRate *= mInputFormat.getChannelCount();
+@@ -305,22 +342,34 @@ class AudioRecorder extends HandlerThread implements Handler.Callback {
+ 
+         @Override
+         public void onInputBufferAvailable(MediaCodec codec, int index) {
+-            mInputBufferIndex = index;
+-            processInputBuffer();
++            if (mReleased) return;
++            try { mInputs.add(index); drainInputs(); }
++            catch (RuntimeException error) { AudioRecorder.this.onError("AAC input failed", error); }
+         }
+ 
+         @Override
+         public void onOutputBufferAvailable(MediaCodec codec, int index, MediaCodec.BufferInfo info) {
+-            processOutputBuffer(index, info);
++            if (mReleased) return;
++            try { processOutputBuffer(index, info); }
++            catch (RuntimeException error) { AudioRecorder.this.onError("AAC output failed", error); }
+         }
+ 
+         @Override
+         public void onError(MediaCodec codec, MediaCodec.CodecException e) {
++            if (mReleased) return;
+             AudioRecorder.this.onError("Encoder error", e);
+         }
+ 
+         @Override
+         public void onOutputFormatChanged(MediaCodec codec, MediaFormat format) {
++            if (mReleased) return;
++            try {
++                if (mMuxerStarted) throw new IllegalStateException("unexpected AAC format change");
++                mOutFormat = format;
++                mMuxerTrack = mMuxer.addTrack(format);
++                mMuxer.start();
++                mMuxerStarted = true;
++            } catch (RuntimeException error) { AudioRecorder.this.onError("AAC format failed", error); }
+         }
+     }
+ 
+diff --git a/src/com/android/fmradio/BcmFmAudio.java b/src/com/android/fmradio/BcmFmAudio.java
+index 3c87059..df5f4c5 100644
+--- a/src/com/android/fmradio/BcmFmAudio.java
++++ b/src/com/android/fmradio/BcmFmAudio.java
+@@ -67,7 +67,7 @@ final class BcmFmAudio {
+             mTrack.play();
+             mManager.setParameters("l_fmradio_mode=on");
+             return true;
+-        } catch (IllegalArgumentException | IllegalStateException error) {
++        } catch (RuntimeException error) {
+             Log.e(TAG, "FM audio start failed", error);
+             stop();
+             return false;
+diff --git a/src/com/android/fmradio/BcmFmCapture.java b/src/com/android/fmradio/BcmFmCapture.java
+new file mode 100644
+index 0000000..a6a124a
+--- /dev/null
++++ b/src/com/android/fmradio/BcmFmCapture.java
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++package com.android.fmradio;
++
++import android.media.AudioDeviceInfo;
++import android.media.AudioFormat;
++import android.media.AudioManager;
++import android.media.AudioRecord;
++import android.media.MediaRecorder;
++import android.os.SystemClock;
++import android.util.Log;
++import java.util.Arrays;
++
++/** Capture ONLY the FM tuner. Never fall back to microphone, voice call or mix. */
++final class BcmFmCapture {
++    interface Sink { void pcm(byte[] samples); void failed(); }
++    private static final String TAG = "BcmFmCapture";
++    private final AudioRecord mRecord;
++    private final int mDeviceId;
++    private volatile boolean mClosed;
++    private Thread mThread;
++
++    private BcmFmCapture(AudioRecord record, int deviceId) {
++        mRecord = record;
++        mDeviceId = deviceId;
++    }
++
++    static BcmFmCapture open(AudioManager manager) {
++        AudioRecord record = null;
++        try {
++            if (manager.getMode() != AudioManager.MODE_NORMAL || manager.isBluetoothScoOn()) return null;
++            AudioDeviceInfo fm = null;
++            for (AudioDeviceInfo device : manager.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
++                if (device.getType() == AudioDeviceInfo.TYPE_FM_TUNER) { fm = device; break; }
++            }
++            if (fm == null) throw new IllegalStateException("FM tuner input is not exposed by audio policy");
++            AudioFormat format = new AudioFormat.Builder().setSampleRate(48000)
++                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build();
++            int minimum = AudioRecord.getMinBufferSize(48000,
++                    AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
++            if (minimum <= 0) throw new IllegalStateException("unsupported FM capture format");
++            record = new AudioRecord.Builder().setAudioSource(MediaRecorder.AudioSource.RADIO_TUNER)
++                    .setAudioFormat(format).setBufferSizeInBytes(Math.max(minimum, 19200)).build();
++            if (record.getState() != AudioRecord.STATE_INITIALIZED || !record.setPreferredDevice(fm))
++                throw new IllegalStateException("cannot select FM capture device");
++            record.startRecording();
++            if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING)
++                throw new IllegalStateException("FM capture did not start");
++            BcmFmCapture capture = new BcmFmCapture(record, fm.getId());
++            byte[] discard = new byte[3840];
++            long deadline = SystemClock.elapsedRealtime() + 1000;
++            // Routing is asynchronous. Discard startup data; create no recording
++            // until the actual route (not merely the preferred device) is FM.
++            while (SystemClock.elapsedRealtime() < deadline) {
++                int n = record.read(discard, 0, discard.length, AudioRecord.READ_NON_BLOCKING);
++                if (n < 0) throw new IllegalStateException("FM capture read error " + n);
++                if (n > 0 && capture.onFm()) return capture;
++                AudioDeviceInfo routed = record.getRoutedDevice();
++                if (routed != null && !capture.onFm())
++                    throw new IllegalStateException("refusing non-FM input");
++                SystemClock.sleep(20);
++            }
++            throw new IllegalStateException("FM capture routing timeout");
++        } catch (RuntimeException error) {
++            Log.e(TAG, "FM capture unavailable", error);
++            if (record != null) record.release();
++            return null;
++        }
++    }
++
++    AudioFormat format() { return mRecord.getFormat(); }
++    private boolean onFm() {
++        AudioDeviceInfo device = mRecord.getRoutedDevice();
++        return device != null && device.getType() == AudioDeviceInfo.TYPE_FM_TUNER
++                && device.getId() == mDeviceId;
++    }
++    synchronized boolean start(Sink sink) {
++        if (mClosed || mThread != null) return false;
++        mThread = new Thread(() -> {
++            boolean failed = false;
++            try {
++                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
++                byte[] buffer = new byte[3840]; // 20 ms of stereo PCM16
++                long lastData = SystemClock.elapsedRealtime();
++                while (!mClosed) {
++                    if (!onFm()) throw new IllegalStateException("FM input route changed");
++                    int n = mRecord.read(buffer, 0, buffer.length, AudioRecord.READ_NON_BLOCKING);
++                    if (n < 0 || n % 4 != 0) throw new IllegalStateException("FM capture failed " + n);
++                    if (!onFm()) throw new IllegalStateException("FM input changed during read");
++                    if (n > 0) {
++                        lastData = SystemClock.elapsedRealtime();
++                        synchronized (BcmFmCapture.this) {
++                            if (!mClosed) sink.pcm(Arrays.copyOf(buffer, n));
++                        }
++                    } else {
++                        if (SystemClock.elapsedRealtime() - lastData > 2000)
++                            throw new IllegalStateException("FM input stalled");
++                        SystemClock.sleep(10);
++                    }
++                }
++            } catch (RuntimeException error) {
++                failed = !mClosed;
++                if (failed) Log.e(TAG, "Stopping FM capture", error);
++            } finally {
++                mRecord.release(); // sole owner after thread starts
++                if (failed) sink.failed();
++            }
++        }, "FM tuner capture");
++        mThread.start();
++        return true;
++    }
++    synchronized void stop() {
++        if (mClosed) return;
++        mClosed = true;
++        // Nonblocking reader exits without waiting for the encoder or a read.
++        // Only the worker releases a running AudioRecord, avoiding use-after-release.
++        if (mThread == null) mRecord.release();
++    }
++}
+diff --git a/src/com/android/fmradio/FmMainActivity.java b/src/com/android/fmradio/FmMainActivity.java
+index e72a855..82db51b 100644
+--- a/src/com/android/fmradio/FmMainActivity.java
++++ b/src/com/android/fmradio/FmMainActivity.java
+@@ -741,10 +741,6 @@ public class FmMainActivity extends Activity implements FmFavoriteEditDialog.Edi
+     public boolean onCreateOptionsMenu(Menu menu) {
+         MenuInflater inflater = getMenuInflater();
+         inflater.inflate(R.menu.fm_action_bar, menu);
+-        if (getResources().getBoolean(R.bool.config_bcmHciFm)) {
+-            menu.findItem(R.id.fm_start_record).setVisible(false);
+-            menu.findItem(R.id.fm_record_list).setVisible(false);
+-        }
+         mMenuItemStationlList = menu.findItem(R.id.fm_station_list);
+         mMenuItemHeadset = menu.findItem(R.id.fm_headset);
+         mMenuItemStartRecord = menu.findItem(R.id.fm_start_record);
+diff --git a/src/com/android/fmradio/FmService.java b/src/com/android/fmradio/FmService.java
+index d1a05ac..d1d7078 100644
+--- a/src/com/android/fmradio/FmService.java
++++ b/src/com/android/fmradio/FmService.java
+@@ -72,6 +72,7 @@ import java.util.Iterator;
+  */
+ public class FmService extends Service implements FmRecorder.OnRecorderStateChangedListener {
+     private boolean mBcmHci;
++    private volatile BcmFmCapture mBcmCapture;
+     private BcmFmAudio mBcmAudio;
+     private volatile boolean mDestroying;
+     private volatile boolean mBcmStopRequested;
+@@ -90,7 +91,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         @Override public void run() {
+             if (mDestroying || mPowerStatus != POWER_UP) return;
+             if (!FmNative.isBcmPowered()) {
+-                mBcmAudio.stop();
++                stopBcmAudio();
+                 bcmNotice(R.string.bcm_fm_failed);
+                 powerDownAsync();
+                 return;
+@@ -99,6 +100,57 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         }
+     };
+ 
++    private void stopBcmAudio() {
++        BcmFmCapture capture = mBcmCapture;
++        if (capture != null) capture.stop();
++        mBcmAudio.stop();
++    }
++
++    private boolean bcmCanProbeAf() {
++        return !mDestroying && !mBcmStopRequested && !mBcmDucked && !mIsScanning && !mIsSeeking
++                && getRecorderState() != FmRecorder.STATE_RECORDING
++                && !mFmServiceHandler.hasMessages(FmListener.MSGID_TUNE_FINISHED)
++                && !mFmServiceHandler.hasMessages(FmListener.MSGID_SEEK_FINISHED)
++                && !mFmServiceHandler.hasMessages(FmListener.MSGID_SCAN_FINISHED)
++                && !mFmServiceHandler.hasMessages(FmListener.MSGID_STARTRECORDING_FINISHED)
++                && !mFmServiceHandler.hasMessages(FmListener.MSGID_POWERUP_FINISHED);
++    }
++
++    // BCM metadata runs on the same handler as tune/seek/scan, not on the legacy
++    // RDS thread. A metadata read cannot race a channel change or an AF probe.
++    private final Runnable mBcmRds = new Runnable() {
++        @Override public void run() {
++            if (mDestroying || mBcmStopRequested || mPowerStatus != POWER_UP) return;
++            int events = FmNative.readRds();
++            if (mDestroying || mBcmStopRequested) return;
++            ContentValues values = new ContentValues();
++            if ((events & RDS_EVENT_PROGRAMNAME) != 0) {
++                byte[] bytes = FmNative.getPs();
++                String ps = bytes == null ? "" : new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
++                setPs(ps);
++                values.put(Station.PROGRAM_SERVICE, ps);
++            }
++            if ((events & RDS_EVENT_LAST_RADIOTEXT) != 0) {
++                byte[] bytes = FmNative.getLrText();
++                String text = bytes == null ? "" : new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
++                setLRText(text);
++                values.put(Station.RADIO_TEXT, text);
++            }
++            if (values.size() > 0) {
++                if (FmStation.isStationExist(mContext, mCurrentStation))
++                    FmStation.updateStationToDb(mContext, mCurrentStation, values);
++                else {
++                    values.put(Station.FREQUENCY, mCurrentStation);
++                    FmStation.insertStationToDb(mContext, values);
++                }
++                updatePlayingNotification();
++            }
++            if ((events & RDS_EVENT_AF) != 0 && bcmCanProbeAf()) activeAf();
++            if (!mDestroying && !mBcmStopRequested)
++                mFmServiceHandler.postDelayed(this, 250);
++        }
++    };
++
+     // Logging
+     private static final String TAG = "FmService";
+ 
+@@ -284,7 +336,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                             != AudioManager.SCO_AUDIO_STATE_DISCONNECTED;
+                 if (unavailable) {
+                     FmNative.stopScan();
+-                    mBcmAudio.stop();
++                    stopBcmAudio();
+                     powerDownAsync();
+                 }
+                 return;
+@@ -716,7 +768,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         if (!FmNative.powerUp(frequency)) {
+             mPowerStatus = POWER_DOWN;
+             if (mBcmHci) {
+-                mBcmAudio.stop();
++                stopBcmAudio();
+                 abandonAudioFocus();
+                 if (mWakeLock.isHeld()) mWakeLock.release();
+                 bcmNotice(R.string.bcm_fm_failed);
+@@ -776,7 +828,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         if (mBcmHci) {
+             mBcmStopRequested = true;
+             FmNative.stopScan();
+-            mBcmAudio.stop();
++            stopBcmAudio();
+         }
+         // if power down Fm, should remove message first.
+         // not remove all messages, because such as recorder message need
+@@ -798,7 +850,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         if (mBcmHci) {
+             mFmServiceHandler.removeCallbacks(mBcmHealth);
+             FmNative.stopScan();
+-            mBcmAudio.stop();
++            stopBcmAudio();
+         }
+         if (mPowerStatus == POWER_DOWN) {
+             return true;
+@@ -874,6 +926,8 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                 mCurrentStation = FmUtils.computeStation(frequency);
+                 FmStation.setCurrentStation(mContext, mCurrentStation);
+                 updatePlayingNotification();
++            } else if (mBcmHci) {
++                setRds(true); // failed tune restored the old frequency
+             }
+             setMute(false);
+             return bRet;
+@@ -921,6 +975,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         setRds(false);
+         mIsNativeSeeking = true;
+         float fRet = FmNative.seek(frequency, isUp);
++        if (mBcmHci) setRds(true); // also restore RDS after no-station/cancellation
+         mIsNativeSeeking = false;
+         // make mIsStopScanCalled false, avoid stop scan make this true,
+         // when start scan, it will return null.
+@@ -1023,6 +1078,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private int setRds(boolean on) {
++        if (mBcmHci) {
++            if (on && (mDestroying || mBcmStopRequested)) return -1;
++            if (!on) { setPs(""); setLRText(""); }
++        }
+         if (mPowerStatus != POWER_UP) {
+             return -1;
+         }
+@@ -1067,7 +1126,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+             return -1;
+         }
+ 
++        if (mBcmHci && !bcmCanProbeAf()) return -1;
+         int frequency = FmNative.activeAf();
++        if (mBcmHci && bcmCanProbeAf() && FmUtils.isValidStation(frequency)
++                && frequency != mCurrentStation) tuneStationAsync(FmUtils.computeFrequency(frequency));
+         return frequency;
+     }
+ 
+@@ -1227,7 +1289,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+ 
+     private void startRecording() {
+         if (mBcmHci) {
+-            onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
++            startBcmRecording();
+             return;
+         }
+         sRecordingSdcard = FmUtils.getDefaultStoragePath();
+@@ -1254,6 +1316,47 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         }
+     }
+ 
++    private void startBcmRecording() {
++        if (mDestroying || mBcmStopRequested || mBcmDucked || mPowerStatus != POWER_UP
++                || getRecorderState() == FmRecorder.STATE_RECORDING) return;
++        sRecordingSdcard = FmUtils.getDefaultStoragePath();
++        if (sRecordingSdcard == null || sRecordingSdcard.isEmpty() || !isSdcardReady(sRecordingSdcard)) {
++            onRecorderError(FmRecorder.ERROR_SDCARD_NOT_PRESENT);
++            return;
++        }
++        final BcmFmCapture capture = BcmFmCapture.open(mAudioManager);
++        if (capture == null) {
++            bcmNotice(R.string.bcm_fm_capture_failed);
++            onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
++            return;
++        }
++        if (mDestroying || mBcmStopRequested || mBcmDucked) { capture.stop(); return; }
++        mBcmCapture = capture;
++        // Preserve the standard AAC encoder, file naming, save/discard and media
++        // database integration. Only the source changes; never render capture PCM.
++        if (mFmRecorder == null) {
++            mFmRecorder = new FmRecorder(capture.format());
++            mFmRecorder.registerRecorderStateListener(FmService.this);
++        }
++        final FmRecorder recorder = mFmRecorder;
++        recorder.startRecording(mContext);
++        if (recorder.getState() != FmRecorder.STATE_RECORDING || !capture.start(new BcmFmCapture.Sink() {
++            @Override public void pcm(byte[] samples) { recorder.encode(samples); }
++            @Override public void failed() {
++                mFmServiceHandler.post(() -> {
++                    if (mBcmCapture != capture) return;
++                    stopRecording();
++                    bcmNotice(R.string.bcm_fm_capture_failed);
++                    onRecorderError(FmRecorder.ERROR_RECORDER_INTERNAL);
++                });
++            }
++        })) {
++            capture.stop();
++            mBcmCapture = null;
++            if (recorder.getState() == FmRecorder.STATE_RECORDING) stopRecording();
++        }
++    }
++
+     private boolean isSdcardReady(String sdcardPath) {
+         if (!mSdcardStateMap.isEmpty()) {
+             if (mSdcardStateMap.get(sdcardPath) != null && !mSdcardStateMap.get(sdcardPath)) {
+@@ -1273,6 +1376,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private boolean stopRecording() {
++        if (mBcmHci && mBcmCapture != null) {
++            mBcmCapture.stop();
++            mBcmCapture = null;
++        }
+         if (mFmRecorder == null) {
+             Log.e(TAG, "stopRecording, called without a valid recorder!!");
+             return false;
+@@ -1592,7 +1699,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+         if (mBcmHci) {
+             mFmServiceHandler.removeCallbacks(mBcmHealth);
+             FmNative.stopScan();
+-            mBcmAudio.stop();
++            stopBcmAudio();
+         }
+         mAudioManager.setParameters("AudioFmPreStop=1");
+         setMute(true);
+@@ -1669,6 +1776,11 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * Start RDS thread to update RDS information
+      */
+     private void startRdsThread() {
++        if (mBcmHci) {
++            mFmServiceHandler.removeCallbacks(mBcmRds);
++            mFmServiceHandler.postDelayed(mBcmRds, 250);
++            return;
++        }
+         mIsRdsThreadExit = false;
+         if (null != mRdsThread) {
+             return;
+@@ -1770,6 +1882,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      * Stop RDS thread to stop listen station RDS change
+      */
+     private void stopRdsThread() {
++        if (mBcmHci) {
++            mFmServiceHandler.removeCallbacks(mBcmRds);
++            return;
++        }
+         if (null != mRdsThread) {
+             // Must call closedev after stopRDSThread.
+             mIsRdsThreadExit = true;
+@@ -1815,7 +1931,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     private boolean enableFmAudio(boolean enable) {
+         if (mBcmHci) {
+             if (!enable) {
+-                mBcmAudio.stop();
++                stopBcmAudio();
+                 return true;
+             }
+             if (mDestroying || mBcmStopRequested || mPowerStatus != POWER_UP
+@@ -1823,7 +1939,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+             if (mBcmDucked) return true; // keep tuner state, but no direct audio route
+             boolean ok = mBcmAudio.start(mIsSpeakerUsed) && bcmVolume();
+             if (!ok) {
+-                mBcmAudio.stop();
++                stopBcmAudio();
+                 bcmNotice(R.string.bcm_fm_failed);
+                 powerDownAsync();
+             }
+@@ -1846,6 +1962,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+     }
+ 
+     private void startPatchOrRender() {
++        if (mBcmHci) return;
+         ArrayList<AudioPatch> patches = new ArrayList<AudioPatch>();
+         mAudioManager.listAudioPatches(patches);
+         if (mAudioPatch == null) {
+@@ -2076,6 +2193,10 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+      */
+     @Override
+     public void onRecorderStateChanged(int state) {
++        if (mBcmHci && state != FmRecorder.STATE_RECORDING && mBcmCapture != null) {
++            mBcmCapture.stop();
++            mBcmCapture = null;
++        }
+         mRecordState = state;
+         Bundle bundle = new Bundle(2);
+         bundle.putInt(FmListener.CALLBACK_FLAG, FmListener.LISTEN_RECORDSTATE_CHANGED);
+@@ -2201,7 +2322,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                         FmNative.stopScan();
+                         // Stop the direct route now, before a worker blocked in
+                         // seek has had time to process the focus-loss message.
+-                        mBcmAudio.stop();
++                        stopBcmAudio();
+                     }
+                     switch (focusChange) {
+                         case AudioManager.AUDIOFOCUS_LOSS:
+@@ -2327,6 +2448,7 @@ public class FmService extends Service implements FmRecorder.OnRecorderStateChan
+                 break;
+ 
+             case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
++                if (mBcmHci && getRecorderState() == FmRecorder.STATE_RECORDING) stopRecording();
+                 setMute(true);
+                 break;
+ 
+diff --git a/tests/capture/android/media/AudioDeviceInfo.java b/tests/capture/android/media/AudioDeviceInfo.java
+new file mode 100644
+index 0000000..64b1786
+--- /dev/null
++++ b/tests/capture/android/media/AudioDeviceInfo.java
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.media;
++public class AudioDeviceInfo {
++ public static final int TYPE_FM_TUNER=16, TYPE_BUILTIN_MIC=15;
++ private int type,id; public AudioDeviceInfo(int t,int i){type=t;id=i;}
++ public int getType(){return type;} public int getId(){return id;}
++}
+diff --git a/tests/capture/android/media/AudioFormat.java b/tests/capture/android/media/AudioFormat.java
+new file mode 100644
+index 0000000..3e42022
+--- /dev/null
++++ b/tests/capture/android/media/AudioFormat.java
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.media;
++public class AudioFormat {
++ public static final int ENCODING_PCM_16BIT=2, ENCODING_PCM_8BIT=3, ENCODING_PCM_FLOAT=4, CHANNEL_IN_STEREO=12;
++ public int getEncoding(){return 2;} public int getChannelCount(){return 2;} public int getSampleRate(){return 48000;}
++ public static class Builder {
++  public Builder setSampleRate(int n){assert n==48000; return this;}
++  public Builder setEncoding(int n){assert n==2;return this;}
++  public Builder setChannelMask(int n){assert n==12;return this;}
++  public AudioFormat build(){return new AudioFormat();}
++ }
++}
+diff --git a/tests/capture/android/media/AudioManager.java b/tests/capture/android/media/AudioManager.java
+new file mode 100644
+index 0000000..756807b
+--- /dev/null
++++ b/tests/capture/android/media/AudioManager.java
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.media;
++public class AudioManager {
++ public static final int MODE_NORMAL=0, GET_DEVICES_INPUTS=1;
++ public int mode=0; public boolean sco=false;
++ public AudioDeviceInfo[] inputs={new AudioDeviceInfo(16,42)};
++ public int getMode(){return mode;} public boolean isBluetoothScoOn(){return sco;}
++ public AudioDeviceInfo[] getDevices(int flag){return inputs;}
++}
+diff --git a/tests/capture/android/media/AudioRecord.java b/tests/capture/android/media/AudioRecord.java
+new file mode 100644
+index 0000000..b13d346
+--- /dev/null
++++ b/tests/capture/android/media/AudioRecord.java
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.media;
++import java.util.concurrent.atomic.AtomicInteger;
++public class AudioRecord {
++ public static final int STATE_INITIALIZED=1, RECORDSTATE_RECORDING=3, READ_NON_BLOCKING=1;
++ public static volatile AudioRecord last;
++ public static volatile AudioDeviceInfo actual=new AudioDeviceInfo(16,42);
++ public static volatile int error=0, changeAfter=0;
++ public static volatile boolean selectable=true, initialized=true, unsupported=false;
++ public final AtomicInteger reads=new AtomicInteger(), releases=new AtomicInteger();
++ public static void reset(){last=null;actual=new AudioDeviceInfo(16,42);error=changeAfter=0;selectable=initialized=true;unsupported=false;}
++ public static int getMinBufferSize(int rate,int ch,int fmt){return 19200;}
++ public int getState(){return initialized?1:0;}
++ public boolean setPreferredDevice(AudioDeviceInfo d){assert d.getType()==16;return selectable;}
++ public void startRecording(){} public int getRecordingState(){return 3;}
++ public AudioFormat getFormat(){return new AudioFormat();}
++ public AudioDeviceInfo getRoutedDevice(){assert releases.get()==0;return actual;}
++ public int read(byte[] data,int off,int n,int mode){
++  assert releases.get()==0 && mode==1;
++  try{Thread.sleep(1);}catch(InterruptedException e){Thread.currentThread().interrupt();}
++  int count=reads.incrementAndGet(); if(changeAfter>0 && count>=changeAfter)actual=new AudioDeviceInfo(15,43);
++  java.util.Arrays.fill(data,(byte)42);return error==0?n:error;
++ }
++ public void release(){assert releases.incrementAndGet()==1;}
++ public static class Builder {
++  public Builder setAudioSource(int n){assert n==1998;return this;}
++  public Builder setAudioFormat(AudioFormat f){return this;}
++  public Builder setBufferSizeInBytes(int n){assert n>=19200;return this;}
++  public AudioRecord build(){if(unsupported)throw new UnsupportedOperationException("unsupported format");return last=new AudioRecord();}
++ }
++}
+diff --git a/tests/capture/android/media/MediaRecorder.java b/tests/capture/android/media/MediaRecorder.java
+new file mode 100644
+index 0000000..5143a5a
+--- /dev/null
++++ b/tests/capture/android/media/MediaRecorder.java
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.media;
++public class MediaRecorder {public static class AudioSource {public static final int RADIO_TUNER=1998;}}
+diff --git a/tests/capture/android/os/Process.java b/tests/capture/android/os/Process.java
+new file mode 100644
+index 0000000..60e0dbc
+--- /dev/null
++++ b/tests/capture/android/os/Process.java
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.os;
++public class Process { public static final int THREAD_PRIORITY_AUDIO=-16; public static void setThreadPriority(int n){} }
+diff --git a/tests/capture/android/os/SystemClock.java b/tests/capture/android/os/SystemClock.java
+new file mode 100644
+index 0000000..e5faa01
+--- /dev/null
++++ b/tests/capture/android/os/SystemClock.java
+@@ -0,0 +1,7 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host test fake, never included in the APK.
++package android.os;
++public class SystemClock {
++ public static long elapsedRealtime(){return System.nanoTime()/1000000;}
++ public static void sleep(long ms){try{Thread.sleep(ms);}catch(InterruptedException e){Thread.currentThread().interrupt();}}
++}
+diff --git a/tests/capture/android/util/Log.java b/tests/capture/android/util/Log.java
+new file mode 100644
+index 0000000..0297ed4
+--- /dev/null
++++ b/tests/capture/android/util/Log.java
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake.
++package android.util;
++public class Log {
++ public static int e(String t,String m,Throwable e){return 0;}
++ public static int w(String t,String m,Throwable e){return 0;}
++ public static int w(String t,String m){return 0;}
++ public static int d(String t,String m){return 0;}
++ public static int v(String t,String m){return 0;}
++ public static int i(String t,String m){return 0;}
++}
+diff --git a/tests/capture/com/android/fmradio/CaptureTest.java b/tests/capture/com/android/fmradio/CaptureTest.java
+new file mode 100644
+index 0000000..10ebd99
+--- /dev/null
++++ b/tests/capture/com/android/fmradio/CaptureTest.java
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.android.fmradio;
++import android.media.*;
++import android.os.SystemClock;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.BooleanSupplier;
++public class CaptureTest {
++    static void waitFor(BooleanSupplier done) {
++        long end=SystemClock.elapsedRealtime()+2000;
++        while(!done.getAsBoolean() && SystemClock.elapsedRealtime()<end)SystemClock.sleep(1);
++        assert done.getAsBoolean();
++    }
++    public static void main(String[] args) {
++        AudioManager manager=new AudioManager();
++        AudioRecord.reset(); manager.inputs=new AudioDeviceInfo[0];
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last==null;
++        System.out.println("PASS capture requires an exposed FM input");
++        manager=new AudioManager(); manager.mode=2;
++        assert BcmFmCapture.open(manager)==null;
++        manager.mode=0;manager.sco=true;assert BcmFmCapture.open(manager)==null;
++        System.out.println("PASS capture refuses call/SCO modes");
++        manager=new AudioManager();
++        AudioRecord.reset();AudioRecord.actual=new AudioDeviceInfo(15,43);
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last.releases.get()==1;
++        System.out.println("PASS capture rejects microphone fallback");
++        AudioRecord.reset();AudioRecord.actual=new AudioDeviceInfo(16,99);
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last.releases.get()==1;
++        System.out.println("PASS capture requires the selected FM device ID");
++        AudioRecord.reset();AudioRecord.selectable=false;
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last.releases.get()==1;
++        AudioRecord.reset();AudioRecord.initialized=false;
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last.releases.get()==1;
++        AudioRecord.reset();AudioRecord.error=-6;
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last.releases.get()==1;
++        AudioRecord.reset();AudioRecord.unsupported=true;
++        assert BcmFmCapture.open(manager)==null && AudioRecord.last==null;
++        System.out.println("PASS capture construction/read failures release resources");
++        AudioRecord.reset();BcmFmCapture unused=BcmFmCapture.open(manager);
++        assert unused!=null;unused.stop();unused.stop();assert AudioRecord.last.releases.get()==1;
++        System.out.println("PASS prepared capture stop is idempotent");
++        AudioRecord.reset();BcmFmCapture capture=BcmFmCapture.open(manager);
++        AtomicInteger frames=new AtomicInteger(),errors=new AtomicInteger();
++        BcmFmCapture.Sink sink=new BcmFmCapture.Sink(){
++            public void pcm(byte[] data){assert data.length%4==0 && data[0]==42;frames.incrementAndGet();}
++            public void failed(){errors.incrementAndGet();}
++        };
++        assert capture.start(sink);waitFor(()->frames.get()>2);capture.stop();
++        int atStop=frames.get();waitFor(()->AudioRecord.last.releases.get()==1);
++        assert frames.get()==atStop && errors.get()==0 && !capture.start(sink);
++        System.out.println("PASS real capture loop feeds PCM and stops without late frames/double release");
++        AudioRecord.reset();AudioRecord.changeAfter=2;frames.set(0);errors.set(0);
++        capture=BcmFmCapture.open(manager);assert capture!=null;assert capture.start(sink);
++        waitFor(()->errors.get()==1);assert frames.get()==0;capture.stop();
++        assert AudioRecord.last.releases.get()==1;
++        System.out.println("PASS route switch during a read discards data and signals failure");
++        System.out.println("8 capture tests passed (mock Android audio, not hardware)");
++    }
++}
+diff --git a/tests/encoder/android/media/MediaCodec.java b/tests/encoder/android/media/MediaCodec.java
+new file mode 100644
+index 0000000..f99ddfb
+--- /dev/null
++++ b/tests/encoder/android/media/MediaCodec.java
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.media;
++import java.io.*;import java.nio.*;import java.util.*;import android.os.Handler;
++public class MediaCodec {
++ public static final int CONFIGURE_FLAG_ENCODE=1,BUFFER_FLAG_END_OF_STREAM=4,BUFFER_FLAG_CODEC_CONFIG=2;
++ public static volatile int mode, attempts;public static volatile MediaCodec last;
++ public volatile int releases,bytes,eos;public final Set<Integer> used=Collections.synchronizedSet(new HashSet<>());
++ private Callback callback;private Handler handler;
++ public static void reset(){mode=attempts=0;last=null;MediaMuxer.last=null;MediaMuxer.failStop=false;}
++ public static MediaCodec createEncoderByType(String mime)throws IOException{attempts++;if(mode==1)throw new IOException("init");return last=new MediaCodec();}
++ public void setCallback(Callback c,Handler h){callback=c;handler=h;}
++ public void configure(MediaFormat f,Object surface,Object crypto,int flags){}
++ public void start(){
++  handler.post(()->{MediaFormat f=new MediaFormat();f.csd=true;callback.onOutputFormatChanged(this,f);});
++  handler.post(()->callback.onOutputBufferAvailable(this,0,new BufferInfo(0,4,BUFFER_FLAG_CODEC_CONFIG)));
++  if(mode!=2)for(int i=0;i<4;i++){final int index=i;handler.post(()->callback.onInputBufferAvailable(this,index));}
++ }
++ public MediaFormat getOutputFormat(){throw new IllegalStateException("format not ready");}
++ public ByteBuffer getInputBuffer(int i){return ByteBuffer.allocate(1024);}
++ public ByteBuffer getOutputBuffer(int i){return ByteBuffer.allocate(32);}
++ public void queueInputBuffer(int index,int offset,int size,long pts,int flags){
++  used.add(index);bytes+=size;
++  if((flags&BUFFER_FLAG_END_OF_STREAM)!=0){eos++;handler.post(()->callback.onOutputBufferAvailable(this,index,new BufferInfo(0,0,BUFFER_FLAG_END_OF_STREAM)));}
++  else {handler.post(()->callback.onOutputBufferAvailable(this,index,new BufferInfo(2,3,0)));
++        handler.post(()->callback.onInputBufferAvailable(this,index));}
++ }
++ public void releaseOutputBuffer(int i,boolean render){}
++ public void stop(){}public void release(){assert ++releases==1;}
++ public static class BufferInfo {public int size,offset,flags;public long presentationTimeUs;public BufferInfo(int o,int s,int f){offset=o;size=s;flags=f;}}
++ public static class CodecException extends RuntimeException {private static final long serialVersionUID=1;}
++ public abstract static class Callback {
++  public abstract void onInputBufferAvailable(MediaCodec c,int index);
++  public abstract void onOutputBufferAvailable(MediaCodec c,int index,BufferInfo info);
++  public abstract void onOutputFormatChanged(MediaCodec c,MediaFormat format);
++  public abstract void onError(MediaCodec c,CodecException error);
++ }
++}
+diff --git a/tests/encoder/android/media/MediaCodecInfo.java b/tests/encoder/android/media/MediaCodecInfo.java
+new file mode 100644
+index 0000000..058104e
+--- /dev/null
++++ b/tests/encoder/android/media/MediaCodecInfo.java
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.media;
++public class MediaCodecInfo {public static class CodecProfileLevel {public static final int AACObjectLC=2;}}
+diff --git a/tests/encoder/android/media/MediaFormat.java b/tests/encoder/android/media/MediaFormat.java
+new file mode 100644
+index 0000000..11cb7c8
+--- /dev/null
++++ b/tests/encoder/android/media/MediaFormat.java
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.media;
++public class MediaFormat {
++ public static final String KEY_MIME="mime",KEY_BIT_RATE="bitrate",KEY_CHANNEL_COUNT="channels",KEY_SAMPLE_RATE="rate",KEY_AAC_PROFILE="aac";
++ public boolean csd;
++ public void setString(String k,String v){} public void setInteger(String k,int v){}
++}
+diff --git a/tests/encoder/android/media/MediaMuxer.java b/tests/encoder/android/media/MediaMuxer.java
+new file mode 100644
+index 0000000..5d05eab
+--- /dev/null
++++ b/tests/encoder/android/media/MediaMuxer.java
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.media;
++import java.io.*;import java.nio.*;
++public class MediaMuxer {
++ public static class OutputFormat {public static final int MUXER_OUTPUT_MPEG_4=0;}
++ public static volatile MediaMuxer last;public static volatile boolean failStop;
++ public volatile boolean started;public volatile int samples,releases;
++ public MediaMuxer(String name,int format)throws IOException{new File(name).createNewFile();last=this;}
++ public int addTrack(MediaFormat format){assert format.csd;return 0;}
++ public void start(){assert !started;started=true;}
++ public void writeSampleData(int track,ByteBuffer data,MediaCodec.BufferInfo info){
++  assert started && info.size>0 && (info.flags&MediaCodec.BUFFER_FLAG_CODEC_CONFIG)==0;
++  assert data.position()==info.offset && data.limit()==info.offset+info.size;samples++;
++ }
++ public void stop(){assert started;if(failStop)throw new IllegalStateException("bad finalization");started=false;}
++ public void release(){assert ++releases==1;}
++}
+diff --git a/tests/encoder/android/os/Handler.java b/tests/encoder/android/os/Handler.java
+new file mode 100644
+index 0000000..ac5cb00
+--- /dev/null
++++ b/tests/encoder/android/os/Handler.java
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.os;
++public class Handler {
++ public interface Callback {boolean handleMessage(Message m);}
++ private final Looper looper;private final Callback cb;
++ public Handler(Looper l){this(l,null);} public Handler(Looper l,Callback c){looper=l;cb=c;}
++ public Message obtainMessage(int what){return obtainMessage(what,null);}
++ public Message obtainMessage(int what,Object obj){Message m=new Message();m.what=what;m.obj=obj;m.target=this;return m;}
++ public boolean post(Runnable r){if(looper.quitting)return false;looper.queue.add(r);return true;}
++ void send(Message m){post(()->cb.handleMessage(m));}
++}
+diff --git a/tests/encoder/android/os/HandlerThread.java b/tests/encoder/android/os/HandlerThread.java
+new file mode 100644
+index 0000000..6392d19
+--- /dev/null
++++ b/tests/encoder/android/os/HandlerThread.java
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.os;
++public class HandlerThread extends Thread {
++ private final Looper looper=new Looper();
++ public HandlerThread(String name){super(name);setDaemon(true);}
++ public Looper getLooper(){return looper;}
++ public void run(){looper.loop();}
++ public boolean quitSafely(){looper.quitting=true;return true;}
++}
+diff --git a/tests/encoder/android/os/Looper.java b/tests/encoder/android/os/Looper.java
+new file mode 100644
+index 0000000..8411d46
+--- /dev/null
++++ b/tests/encoder/android/os/Looper.java
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.os;
++import java.util.concurrent.*;
++public class Looper {
++ final BlockingQueue<Runnable> queue=new LinkedBlockingQueue<>();
++ volatile boolean quitting; public static volatile Throwable failure;
++ private static final Looper MAIN=new Looper();
++ static {Thread t=new Thread(()->MAIN.loop());t.setDaemon(true);t.start();}
++ public static Looper getMainLooper(){return MAIN;}
++ void loop(){try{while(!quitting || !queue.isEmpty()){Runnable r=queue.poll(50,TimeUnit.MILLISECONDS);if(r!=null)r.run();}}
++ catch(Throwable e){failure=e;quitting=true;}}
++}
+diff --git a/tests/encoder/android/os/Message.java b/tests/encoder/android/os/Message.java
+new file mode 100644
+index 0000000..a231abb
+--- /dev/null
++++ b/tests/encoder/android/os/Message.java
+@@ -0,0 +1,4 @@
++// SPDX-License-Identifier: Apache-2.0
++// Host-only fake, not an Android codec test.
++package android.os;
++public class Message {public int what; public Object obj; Handler target;public void sendToTarget(){target.send(this);}}
+diff --git a/tests/encoder/com/android/fmradio/EncoderTest.java b/tests/encoder/com/android/fmradio/EncoderTest.java
+new file mode 100644
+index 0000000..82e0b5b
+--- /dev/null
++++ b/tests/encoder/com/android/fmradio/EncoderTest.java
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.android.fmradio;
++import android.media.*;
++import android.os.*;
++import java.io.File;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.BooleanSupplier;
++public class EncoderTest {
++    static void waitFor(BooleanSupplier done) {
++        long end=SystemClock.elapsedRealtime()+2000;
++        while(!done.getAsBoolean() && SystemClock.elapsedRealtime()<end){
++            if(Looper.failure!=null)throw new AssertionError(Looper.failure);
++            SystemClock.sleep(1);
++        }
++        if(Looper.failure!=null)throw new AssertionError(Looper.failure);
++        assert done.getAsBoolean();
++    }
++    static AudioRecorder create() throws Exception {
++        File file=File.createTempFile("fm-encoder-", ".m4a");file.deleteOnExit();
++        return new AudioRecorder(new AudioFormat.Builder().build(),file);
++    }
++    public static void main(String[] args)throws Exception {
++        AtomicInteger errors=new AtomicInteger();
++        MediaCodec.reset();AudioRecorder r=create();r.setCallback(e->errors.incrementAndGet());
++        r.encode(new byte[3840]);r.stopRecording();waitFor(()->MediaCodec.last.releases==1);
++        assert MediaCodec.last.bytes==3840 && MediaCodec.last.eos==1 && MediaCodec.last.used.size()>1;
++        assert MediaMuxer.last.samples==4 && MediaMuxer.last.releases==1 && errors.get()==0;
++        r.stopRecording();r.encode(new byte[16]);assert MediaCodec.last.bytes==3840;
++        System.out.println("PASS encoder waits for CSD, skips config, handles all input buffers and drains one EOS");
++        MediaCodec.reset();errors.set(0);MediaCodec.mode=1;r=create();
++        waitFor(()->MediaCodec.attempts==1);SystemClock.sleep(30);
++        r.setCallback(e->errors.incrementAndGet());waitFor(()->errors.get()==1);r.stopRecording();
++        System.out.println("PASS encoder early initialization error reaches a late callback");
++        MediaCodec.reset();errors.set(0);MediaCodec.mode=2;r=create();r.setCallback(e->errors.incrementAndGet());
++        r.encode(new byte[1024*1024+1]);waitFor(()->errors.get()==1);r.stopRecording();
++        assert MediaCodec.last.releases==1 && MediaCodec.last.bytes==0;
++        System.out.println("PASS encoder bounds stalled PCM backlog");
++        MediaCodec.reset();errors.set(0);MediaCodec.mode=2;r=create();r.setCallback(e->errors.incrementAndGet());
++        long start=SystemClock.elapsedRealtime();r.stopRecording();
++        assert SystemClock.elapsedRealtime()-start<5500;waitFor(()->MediaCodec.last.releases==1);
++        waitFor(()->errors.get()>0);
++        System.out.println("PASS encoder EOS timeout is bounded and cleans up");
++        MediaCodec.reset();errors.set(0);MediaMuxer.failStop=true;r=create();r.setCallback(e->errors.incrementAndGet());
++        r.encode(new byte[3840]);r.stopRecording();waitFor(()->errors.get()==1);
++        assert MediaCodec.last.releases==1 && MediaMuxer.last.releases==1;
++        System.out.println("PASS encoder finalization failure reports an error and releases once");
++        MediaCodec.reset();errors.set(0);r=create();r.setCallback(e->errors.incrementAndGet());
++        r.encode(new byte[3]);waitFor(()->errors.get()==1);r.stopRecording();
++        assert MediaCodec.last.releases==1;
++        System.out.println("PASS encoder rejects unaligned PCM without a worker crash");
++        System.out.println("6 encoder tests passed (mock codec/muxer, not M4A validation)");
++    }
++}
+diff --git a/tests/run_capture_tests.py b/tests/run_capture_tests.py
+new file mode 100644
+index 0000000..3ef1cc0
+--- /dev/null
++++ b/tests/run_capture_tests.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++"""Run real capture/encoder helpers against mock Android audio/codec boundaries."""
++import argparse
++from pathlib import Path
++import subprocess
++import tempfile
++p = argparse.ArgumentParser(description=__doc__)
++p.add_argument('--java-home', type=Path, help='JDK with javac/java; otherwise use PATH')
++args = p.parse_args()
++tests = Path(__file__).resolve().parent
++sources = [str(path) for path in (tests / 'capture').rglob('*.java')]
++sources += [str(path) for path in (tests / 'encoder').rglob('*.java')]
++sources += [str(tests.parent / 'src/com/android/fmradio' / name)
++            for name in ('BcmFmCapture.java', 'AudioRecorder.java')]
++with tempfile.TemporaryDirectory(prefix='fm-capture-test-') as temp:
++    tool = lambda name: str(args.java_home / 'bin' / name) if args.java_home else name
++    subprocess.run([tool('javac'), '-source', '8', '-target', '8', '-d', temp, *sources], check=True)
++    for test in ('CaptureTest', 'EncoderTest'):
++        subprocess.run([tool('java'), '-ea', '-Djava.io.tmpdir=' + temp, '-cp', temp,
++                        'com.android.fmradio.' + test], check=True, timeout=30)

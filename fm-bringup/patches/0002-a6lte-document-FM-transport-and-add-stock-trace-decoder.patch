@@ -1,0 +1,554 @@
+From e045e83f5250c5872d112916b9655a0b12692061 Mon Sep 17 00:00:00 2001
+From: A6 FM bring-up <a6lte-fm@localhost>
+Date: Mon, 28 Sep 2026 12:00:00 +0200
+Subject: [PATCH 2/2] a6lte: document FM transport and add stock trace decoder
+
+Record the manifest-derived source selection and stock evidence
+for FM in the Broadcom Bluetooth stack, rather than a Si470x or
+existing V4L2 backend. Document the remaining full integration work.
+
+Add an offline H4 btsnoop filter for FM register/PCM commands,
+responses and interrupts with framing and CLI tests. Retain raw
+FM bytes but omit unrelated traffic and absolute timestamps.
+
+No radio app, backend, kernel driver or SELinux grants are enabled.
+A stock A6 receive trace and on-device validation are still needed.
+---
+ docs/fm-radio.md                      | 179 ++++++++++++++++++++++++++
+ tools/fm/decode_btsnoop.py            | 158 +++++++++++++++++++++++
+ tools/fm/tests/test_decode_btsnoop.py | 175 +++++++++++++++++++++++++
+ 3 files changed, 512 insertions(+)
+ create mode 100644 docs/fm-radio.md
+ create mode 100644 tools/fm/decode_btsnoop.py
+ create mode 100644 tools/fm/tests/test_decode_btsnoop.py
+
+diff --git a/docs/fm-radio.md b/docs/fm-radio.md
+new file mode 100644
+index 0000000..9e8f8c0
+--- /dev/null
++++ b/docs/fm-radio.md
+@@ -0,0 +1,179 @@
++# A6 (a6lte) FM radio bring-up — LineageOS 18.1
++
++## Status
++
++**Not a working FM implementation.** This change fixes the Bluetooth firmware
++filename and provides an offline trace decoder and an integration plan. It does
++not yet add an FM app/backend, claim reception or audio works, or relax SELinux.
++A stock A6 FM trace and device testing are needed before implementing the missing
++transport and audio integration. The Python tests exercise the decoder, not FM
++hardware, an Android build, or Bluetooth firmware loading.
++
++## Source selection
++
++The intended source layout is the organization's
++[j5y17lte lineage-18.1-lts manifest](https://github.com/samsungexynos7870/android_manifest_samsung_j5y17lte/blob/lineage-18.1-lts/j5y17lte.xml),
++with the device-specific projects replaced by A6 projects:
++
++| Path | GitHub repository (under samsungexynos7870 unless noted) | Revision |
++| --- | --- | --- |
++| `device/samsung/a6lte` | `android_device_samsung_a6lte` | `lineage-18.1` |
++| `device/samsung/universal7870-common` | `android_device_samsung_universal7870-common` | `lineage-18.1-oss_bsp-vndk` |
++| `kernel/samsung/exynos7870` | `android_kernel_samsung_exynos7870` | `lineage-18.1-lts` |
++| `vendor/samsung/a6lte` | `android_vendor_samsung_a6lte` | `lineage-18.1` |
++| `vendor/samsung/universal7870-common` | `android_vendor_samsung_universal7870-common` | `lineage-18.1-lts` |
++| `hardware/samsung` | `android_hardware_samsung` | `lineage-18.1` |
++| `system/bt` | `LineageOS/android_system_bt` | `lineage-18.1` |
++| `packages/apps/FMRadio` | `LineageOS/android_packages_apps_FMRadio` | `lineage-18.1` |
++
++Keep the remaining BSP and policy projects at the manifest's revisions. In
++particular, the common device tree is **not** its plain `lineage-18.1` branch.
++The latter requests a different primary audio module. The matching LTS vendor
++branch has the Samsung SEC primary audio HAL used by the A6 device's existing
++`TARGET_DEVICE_HAS_SEC_AUDIO_HAL := true` selection.
++
++The device-tree patch base is `a6b97426994a2d03df18087ed8b8c4c84a69905c`.
++The inspected common/kernel/vendor-common commits are respectively
++`a433c37b08659956b366e06019c36e310a0b2781`,
++`e41078f882271fe43089a683a200bdab8803483b`, and
++`5c77cae3529a5ca03f12a5988a7cb0247bbced96`.
++These are inspection baselines, not evidence of a successfully built ROM.
++
++## Evidence from stock A600FNXXU9CVB1
++
++The reference dump is
++[Exynos7870-labs/samsung_a6lte_dump](https://github.com/Exynos7870-labs/samsung_a6lte_dump/tree/59c75738f83f4307f18f41b80cf2b578dad9ff51),
++fingerprint
++`samsung/a6ltexx/a6lte:10/QP1A.190711.020/A600FNXXU9CVB1:user/release-keys`.
++
++* The embedded stock `boot/kernel` IKCONFIG contains `CONFIG_BT_BCM43XX=y`,
++  `CONFIG_BCM43456=y`, `# CONFIG_MEDIA_RADIO_SUPPORT is not set`, and
++  `# CONFIG_FM_SI47XX is not set`.
++* `vendor/etc/floating_feature.xml` reports FM chip-vendor value `2`. This value
++  alone is not used to identify the chip: the kernel and Bluetooth libraries
++  corroborate a Broadcom path.
++* `system/system/lib/libbluetooth.so` contains FM-specific strings such as
++  `get_fm_interface`, `btif_fm_enable`/`btif_fm_disable`, and `BTA_FM_*` events.
++  `libbluetooth_jni.so` contains `register_com_broadcom_fm_service` and native FM
++  callback names. The stock FM support is integrated into Samsung's Bluetooth
++  stack, not a standalone FM JNI library ready to copy into LineageOS.
++* Stock and the A6 blob list supply
++  `/vendor/firmware/bcm4345C5_V0069.0172.hcd`. The pre-existing device config
++  instead named `bcm43455.hcd`. The firmware-selection patch selects the file
++  actually shipped. It does not replace firmware bytes or prove they expose a
++  compatible FM command protocol under LineageOS.
++* The device mixer files already contain `fm_radio-headset`, `fm_radio-speaker`,
++  and `fm_radio-fm-recording`, their gain paths, and an FM PCM DAI link of `4`.
++* Stock's audio HAL recognizes `l_fmradio_mode`. Inspection of the stock ARM
++  code identifies comparisons with `ready` and `on`; this is **not** enough to
++  determine the full start/stop/routing/volume lifecycle.
++* Generic init grants to `/dev/radio0` exist even in stock, whose kernel has no
++  V4L2 radio support enabled. Those grants do not establish that a tuner device
++  exists. Likewise the common audio policy's FM input port does not prove audio
++  capture or playback is operational.
++
++Do **not** enable Si470x/RTC6213N support based on `/dev/radio0` init entries.
++Do **not** simply set `BOARD_HAVE_BCM_FM` and ship `FMRadio`: LineageOS's
++`hardware/broadcom/fm` backend requires a kernel V4L2/shared-transport driver that
++is not provided by the inspected A6 kernel. Importing that backend entails a
++separate UART/line-discipline port; it is not an app-only change.
++`libfmq.so` is a Fast Message Queue library, not an FM receiver implementation.
++Samsung's `HybridRadio.apk` also depends on Samsung framework/Bluetooth APIs;
++copying the APK alone is not an integration.
++
++## Next required input: a stock receive session
++
++Use a stock **A6**, not a J5 or another BCM device. Firmware register definitions,
++I2S pin routing, and power sequencing must be established for this board.
++
++1. Connect wired headphones (the antenna). In Developer options enable full
++   Bluetooth HCI snoop logging if available. Restart Bluetooth as required by
++   the stock logging setting. Do not change UART ownership or line discipline.
++2. Start from FM off. Note whether Bluetooth was initially off or on. Open stock
++   Radio, power on, tune a known local station, seek once, switch to speaker and
++   back, change volume, and power off. Note station frequencies and the action
++   order. Repeat once with the opposite initial Bluetooth state if practical.
++3. Retrieve the HCI log using the device's supported mechanism. On some builds
++   `adb bugreport fm-stock.zip` includes a btsnoop file; on others a rooted stock
++   device is needed to read it. Paths vary, so inspect archive member names
++   rather than assuming `/sdcard/btsnoop_hci.log` exists. Do not root or flash a
++   working phone just for this task without weighing the consequences.
++4. Extract the uncompressed `btsnoop_hci.log` locally. The decoder accepts
++   btsnoop v1 H4/datalink 1002, **not** a ZIP or `btsnooz` container:
++
++   ```sh
++   python3 device/samsung/a6lte/tools/fm/decode_btsnoop.py \
++       /path/to/btsnoop_hci.log > fm-stock.jsonl
++   ```
++
++5. Check the exit code. `0` means selected records were decoded, `1` means none
++   were present, and `2` means invalid/unreadable input. Discard partial output
++   on exit `2`. Review the JSONL before sharing it, along with the action order,
++   phone model, and stock build. Do not share the whole capture or bugreport:
++   they can contain device addresses, pairing information, and personal data.
++6. Disable HCI logging afterward. A trace with no selected records is not proof
++   of no FM support: stock may filter vendor commands. In that case report the
++   logging mode, file format, and file size rather than uploading all traffic.
++
++The decoder keeps only opcode `0xfc15` register transactions, `0xfc61` PCM pin
++transactions, their completion/status responses, and vendor subevent `0x08`.
++It preserves raw parameters, relative timing, errors, and drop counts. Register
++labels are hints from the Broadcom FM protocol, not validated BCM4345C5 register
++semantics. `0xfc61` is also used by Bluetooth audio; its presence alone is not
++FM evidence. Filtered output can still reveal station/RDS data and timing.
++
++For audio integration, collect local before/during/after snapshots of
++`adb shell dumpsys media.audio_flinger` and `adb shell dumpsys media.audio_policy`.
++Review for personal information before sharing relevant sections. These may
++identify PCM/routing state but do not replace tracing the Samsung audio
++parameter sequence. Do not infer that a string found in the HAL is sufficient
++to enable audio.
++
++## Full integration work still outstanding
++
++Preferred architecture to evaluate against the stock trace:
++
++1. **Bluetooth transport (`system/bt`)**: add a device-gated, narrowly scoped FM
++   endpoint which submits commands through Fluoride's existing HCI queue. Keep
++   command credits, completion ownership, Bluetooth power/lifetime, client
++   death, timeouts, and concurrent SCO use under one owner. Authenticate clients
++   and restrict operations; never expose an arbitrary HCI injector over TCP.
++   Opening `/dev/ttySAC0` independently while Bluetooth owns it is not safe.
++2. **FM backend/app**: provide a separate HCI backend implementing the Lineage
++   FMRadio native interface. Integrate adapter lifecycle and a user-visible
++   failure path; do not reuse the MTK ioctl backend or install two `libfmjni`
++   modules. Implement power, tune, seek/cancel, mute, scan, and RDS according to
++   the A6's observed responses, including timeout/error recovery.
++3. **Audio integration**: validate the Samsung HAL parameter/PCM lifecycle,
++   output selection, audio focus, stream volume, recording input, headset
++   removal, and call/SCO preemption. Reuse the existing board mixer controls
++   where applicable; do not toggle mixers underneath AudioFlinger. Establish
++   whether the existing FM input policy needs an attached-device declaration
++   or dynamic connection handling.
++4. **Device/policy wiring**: only after the backend is implemented, package the
++   app and backend, add its dependency/config selection, and grant the minimum
++   required IPC permissions. Preserve enforcing SELinux. No global permissive
++   mode, generic app device access, or blanket vendor-command access.
++5. **Validate**: build the ROM and policy; verify firmware loading and normal
++   Bluetooth before FM testing. On the phone test cold/warm power cycles, weak
++   and strong stations, tune/readback, seek/cancel, RDS, volume/mute, speaker and
++   headset, recording if exposed, suspend/resume, incoming calls, SCO/A2DP,
++   Wi-Fi coexistence, Bluetooth toggles, app crash, and repeated FM start/stop.
++   Confirm the receiver is powered down when the FM client exits.
++
++No kernel change is currently justified for the proposed userspace HCI design.
++That is a design choice to validate, not a statement that all kernel/audio
++support has already been tested. The stock trace is the next gate; full app
++integration is not completed by these preparatory patches.
++
++## Host tests
++
++From this device repository:
++
++```sh
++python3 -m unittest discover -s tools/fm/tests -v
++```
++
++Tests cover framing, filtering, raw parameter preservation, statuses,
++interrupts, relative timestamps, malformed/truncated records, and CLI failures.
++No Python packages outside the standard library are required.
+diff --git a/tools/fm/decode_btsnoop.py b/tools/fm/decode_btsnoop.py
+new file mode 100644
+index 0000000..08a3953
+--- /dev/null
++++ b/tools/fm/decode_btsnoop.py
+@@ -0,0 +1,158 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 The LineageOS Project
++"""Extract Broadcom FM/PCM transactions from an Android H4 btsnoop capture.
++
++Offline only: never connects to a phone or transmits HCI commands. Output is
++JSON Lines and omits unrelated Bluetooth traffic and absolute timestamps.
++Register names are protocol hints, not proof of a particular firmware's ABI.
++"""
++
++import argparse
++import json
++from pathlib import Path
++import struct
++import sys
++
++MAGIC = b"btsnoop\0"
++H4_DATALINK = 1002
++MAX_RECORD = 65540  # H4 ACL packet: type + 4-byte header + uint16 payload
++OPCODES = {0xFC15: "broadcom_fm_register", 0xFC61: "broadcom_pcm_pin_routing"}
++REGISTERS = {
++    0x00: "RDS_SYS", 0x01: "FM_CTRL", 0x02: "RDS_CTL0",
++    0x04: "AUD_PAUS", 0x05: "AUD_CTL0", 0x06: "AUD_CTL1",
++    0x07: "SCH_CTL0", 0x08: "SEARCH_SNR", 0x09: "SCH_TUNE",
++    0x0A: "FM_FREQ", 0x0B: "FM_FREQ1", 0x0F: "RSSI",
++    0x10: "FM_RDS_MSK", 0x11: "FM_RDS_MSK1",
++    0x12: "FM_RDS_FLAG", 0x13: "FM_RDS_FLAG1", 0x14: "RDS_WLINE",
++    0x28: "RCV_ID", 0x29: "CFG", 0x4D: "PCM_ROUTE", 0x80: "RDS_DATA",
++    0xDE: "PRESCAN_QUALITY", 0xDF: "SNR", 0xF8: "VOLUME_CTRL",
++    0xF9: "BLEND_MUTE", 0xFB: "SEARCH_BOUNDARY", 0xFC: "SEARCH_METHOD",
++    0xFD: "SCH_STEP", 0xFE: "PRESET_MAX", 0xFF: "PRESET_STA",
++}
++
++
++class CaptureError(ValueError):
++    """A capture is incomplete, unsupported, or malformed."""
++
++
++def read_exact(stream, size, what):
++    data = stream.read(size)
++    if len(data) != size:
++        raise CaptureError("truncated " + what)
++    return data
++
++
++def decode_packet(packet):
++    """Return a selected event, or None. Preserve raw FM bytes without guessing."""
++    if not packet:
++        raise CaptureError("empty H4 packet")
++    packet_type = packet[0]
++    if packet_type == 0x01:
++        if len(packet) < 4 or len(packet) != 4 + packet[3]:
++            raise CaptureError("invalid H4 command length")
++        opcode = int.from_bytes(packet[1:3], "little")
++        if opcode not in OPCODES:
++            return None
++        payload = packet[4:]
++        result = {"kind": "command", "opcode": f"0x{opcode:04x}",
++                  "operation": OPCODES[opcode], "parameters": payload.hex()}
++        if opcode == 0xFC15:
++            if len(payload) < 3:
++                raise CaptureError("short FM register command")
++            reg, mode = payload[:2]
++            result["register"] = f"0x{reg:02x}"
++            result["register_hint"] = REGISTERS.get(reg, "unknown")
++            result["access"] = {0: "write", 1: "read"}.get(mode, "unknown")
++            # Retain unknown access modes rather than interpreting another ABI.
++            if mode == 1:
++                result["requested_bytes"] = payload[2]
++            elif mode == 0:
++                result["value_bytes"] = payload[2:].hex()
++        return result
++    if packet_type != 0x04:
++        return None  # ACL/SCO/ISO data never appears in the output.
++    if len(packet) < 3 or len(packet) != 3 + packet[2]:
++        raise CaptureError("invalid H4 event length")
++    event, params = packet[1], packet[3:]
++    if event == 0x0E:
++        if len(params) < 3:
++            raise CaptureError("short Command Complete event")
++        opcode = int.from_bytes(params[1:3], "little")
++        if opcode not in OPCODES:
++            return None
++        if len(params) < 4:
++            raise CaptureError("missing vendor command status")
++        return {"kind": "command_complete", "opcode": f"0x{opcode:04x}",
++                "status": params[3], "return_parameters": params[4:].hex()}
++    if event == 0x0F:
++        if len(params) != 4:
++            raise CaptureError("invalid Command Status event")
++        opcode = int.from_bytes(params[2:4], "little")
++        if opcode in OPCODES:
++            return {"kind": "command_status", "opcode": f"0x{opcode:04x}",
++                    "status": params[0]}
++    if event == 0xFF and params[:1] == b"\x08":
++        return {"kind": "fm_interrupt", "parameters": params.hex()}
++    return None
++
++
++def iter_events(stream):
++    header = read_exact(stream, 16, "btsnoop header")
++    if header[:8] != MAGIC:
++        raise CaptureError("not btsnoop (btsnooz/bugreport containers must be extracted first)")
++    version, datalink = struct.unpack(">II", header[8:])
++    if version != 1 or datalink != H4_DATALINK:
++        raise CaptureError(f"expected btsnoop version 1 / H4 datalink 1002; got {version}/{datalink}")
++    record = 0
++    first_selected_time = None
++    while True:
++        raw_header = stream.read(24)
++        if not raw_header:
++            return
++        record += 1
++        if len(raw_header) != 24:
++            raise CaptureError(f"record {record}: truncated record header")
++        original, included, flags, drops, timestamp = struct.unpack(">IIIIQ", raw_header)
++        if original != included:
++            raise CaptureError(f"record {record}: truncated packet ({included}/{original} bytes)")
++        if not 1 <= included <= MAX_RECORD:
++            raise CaptureError(f"record {record}: invalid packet size {included}")
++        packet = read_exact(stream, included, f"record {record} packet")
++        try:
++            event = decode_packet(packet)
++        except CaptureError as exc:
++            raise CaptureError(f"record {record}: {exc}") from exc
++        if event is None:
++            continue
++        if first_selected_time is None:
++            first_selected_time = timestamp
++        yield {"record": record, "elapsed_us": timestamp - first_selected_time,
++               "direction": "controller_to_host" if flags & 1 else "host_to_controller",
++               "cumulative_drops": drops, **event}
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("capture", type=Path, help="uncompressed Android H4 btsnoop file")
++    args = parser.parse_args(argv)
++    count = 0
++    try:
++        with args.capture.open("rb") as stream:
++            for event in iter_events(stream):
++                print(json.dumps(event, sort_keys=True))
++                count += 1
++    except (OSError, CaptureError) as exc:
++        print(f"error: {exc}; discard any partial output", file=sys.stderr)
++        return 2
++    if count == 0:
++        print("No selected FM/PCM transactions found. This does not prove absence of FM: "
++              "logging may filter vendor commands, or the transport may differ.", file=sys.stderr)
++        return 1
++    print(f"Extracted {count} FM/PCM records. PCM pin commands alone are not proof of FM.",
++          file=sys.stderr)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/fm/tests/test_decode_btsnoop.py b/tools/fm/tests/test_decode_btsnoop.py
+new file mode 100644
+index 0000000..925a2d8
+--- /dev/null
++++ b/tools/fm/tests/test_decode_btsnoop.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 The LineageOS Project
++import contextlib
++import io
++from pathlib import Path
++import struct
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import decode_btsnoop as decoder
++
++HEADER = b"btsnoop\0" + struct.pack(">II", 1, 1002)
++
++
++def command(opcode, params):
++    return b"\x01" + struct.pack("<H", opcode) + bytes([len(params)]) + params
++
++
++def event(code, params):
++    return bytes([4, code, len(params)]) + params
++
++
++def record(packet, time=100, flags=2, drops=0):
++    return struct.pack(">IIIIQ", len(packet), len(packet), flags, drops, time) + packet
++
++
++def decode(*packets):
++    return list(decoder.iter_events(io.BytesIO(HEADER + b"".join(record(p) for p in packets))))
++
++
++class DecoderTests(unittest.TestCase):
++    def test_fm_write(self):
++        row, = decode(command(0xFC15, b"\x0a\x00\xcc\x5b"))
++        self.assertEqual(row["parameters"], "0a00cc5b")
++        self.assertEqual(row["register_hint"], "FM_FREQ")
++        self.assertEqual(row["access"], "write")
++        self.assertEqual(row["value_bytes"], "cc5b")
++        self.assertNotIn("frequency", row)  # Firmware semantics aren't assumed.
++
++    def test_fm_read(self):
++        row, = decode(command(0xFC15, b"\x12\x01\x02"))
++        self.assertEqual(row["requested_bytes"], 2)
++        self.assertEqual(row["access"], "read")
++
++    def test_unknown_register_and_mode_preserved(self):
++        row, = decode(command(0xFC15, b"\xaa\x03\x77"))
++        self.assertEqual(row["register_hint"], "unknown")
++        self.assertEqual(row["access"], "unknown")
++        self.assertEqual(row["parameters"], "aa0377")
++
++    def test_pin_routing_is_not_interpreted_as_register_access(self):
++        row, = decode(command(0xFC61, b"\x07\x19\x18\x19\x19"))
++        self.assertEqual(row["operation"], "broadcom_pcm_pin_routing")
++        self.assertNotIn("register", row)
++
++    def test_command_complete_retains_echo(self):
++        row, = decode(event(0x0E, b"\x01\x15\xfc\x00\x12\x01\x03\x00"))
++        self.assertEqual(row["status"], 0)
++        self.assertEqual(row["return_parameters"], "12010300")
++
++    def test_error_status(self):
++        row, = decode(event(0x0E, b"\x01\x15\xfc\x01"))
++        self.assertEqual(row["status"], 1)
++        self.assertEqual(row["return_parameters"], "")
++
++    def test_command_status(self):
++        row, = decode(event(0x0F, b"\x0c\x01\x61\xfc"))
++        self.assertEqual(row["kind"], "command_status")
++        self.assertEqual(row["status"], 12)
++
++    def test_fm_interrupt(self):
++        row, = decode(event(0xFF, b"\x08\x00"))
++        self.assertEqual(row["kind"], "fm_interrupt")
++
++    def test_unrelated_traffic_omitted(self):
++        self.assertEqual(decode(
++            command(0x0C03, b""),
++            command(0xFC01, b"private_vendor_data"),
++            event(0x0E, b"\x01\x03\x0c\x00"),
++            event(0x0F, b"\x00\x01\x03\x0c"),
++            event(0xFF, b"\x09private_vendor_data"),
++            event(0x03, b"private_connection_data"),
++            b"\x02private_acl_data", b"\x03private_sco_data"), [])
++
++    def test_relative_time_direction_and_drops(self):
++        capture = HEADER + record(command(0x0C03, b""), time=10)
++        capture += record(command(0xFC15, b"\x00\x00\x01"), time=500)
++        capture += record(event(0x0E, b"\x01\x15\xfc\x00"), time=1500, flags=3, drops=4)
++        a, b = decoder.iter_events(io.BytesIO(capture))
++        self.assertEqual(a["elapsed_us"], 0)
++        self.assertEqual(a["record"], 2)
++        self.assertEqual(b["elapsed_us"], 1000)
++        self.assertEqual(b["direction"], "controller_to_host")
++        self.assertEqual(b["cumulative_drops"], 4)
++        self.assertNotIn("timestamp", a)
++
++    def test_backward_clock_preserved(self):
++        p = command(0xFC15, b"\x00\x00\x01")
++        rows = list(decoder.iter_events(io.BytesIO(HEADER + record(p, 20) + record(p, 10))))
++        self.assertEqual(rows[1]["elapsed_us"], -10)
++
++    def test_empty_valid_capture(self):
++        self.assertEqual(decode(), [])
++
++    def test_invalid_headers(self):
++        for header in (b"", b"btsnoop", b"wrong!!!" + HEADER[8:],
++                       b"btsnoop\0" + struct.pack(">II", 2, 1002),
++                       b"btsnoop\0" + struct.pack(">II", 1, 1001)):
++            with self.subTest(header=header), self.assertRaises(decoder.CaptureError):
++                list(decoder.iter_events(io.BytesIO(header)))
++
++    def test_truncated_record_header(self):
++        for n in range(1, 24):
++            with self.subTest(length=n), self.assertRaises(decoder.CaptureError):
++                list(decoder.iter_events(io.BytesIO(HEADER + bytes(n))))
++
++    def test_truncated_payload(self):
++        with self.assertRaises(decoder.CaptureError):
++            list(decoder.iter_events(io.BytesIO(HEADER + struct.pack(">IIIIQ", 4, 4, 0, 0, 0) + b"\x01")))
++
++    def test_rejects_capture_truncation_and_oversized_records(self):
++        for orig, incl in ((3, 2), (2, 3), (0, 0), (65541, 65541), (0xFFFFFFFF, 0xFFFFFFFF)):
++            with self.subTest(orig=orig, incl=incl), self.assertRaises(decoder.CaptureError):
++                list(decoder.iter_events(io.BytesIO(HEADER + struct.pack(">IIIIQ", orig, incl, 0, 0, 0))))
++
++    def test_malformed_hci_lengths(self):
++        for packet in (b"", b"\x01", b"\x01\x15\xfc\x04\x00",
++                       b"\x04", b"\x04\x0e\x04\x00",
++                       command(0xFC15, b"\x00\x00"),
++                       event(0x0E, b"\x01\x15"), event(0x0E, b"\x01\x15\xfc"),
++                       event(0x0F, b"\x00\x01\x15")):
++            with self.subTest(packet=packet), self.assertRaises(decoder.CaptureError):
++                decoder.decode_packet(packet)
++
++    def run_cli(self, content):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "capture.log"
++            path.write_bytes(content)
++            out, err = io.StringIO(), io.StringIO()
++            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
++                status = decoder.main([str(path)])
++            return status, out.getvalue(), err.getvalue()
++
++    def test_cli_success(self):
++        status, out, err = self.run_cli(HEADER + record(command(0xFC15, b"\x00\x00\x01")))
++        self.assertEqual(status, 0)
++        self.assertIn('"opcode": "0xfc15"', out)
++        self.assertIn("Extracted 1", err)
++
++    def test_cli_no_data_is_not_success(self):
++        status, out, err = self.run_cli(HEADER)
++        self.assertEqual(status, 1)
++        self.assertEqual(out, "")
++        self.assertIn("does not prove absence", err)
++
++    def test_cli_invalid_input_is_not_success(self):
++        status, out, err = self.run_cli(b"wrong")
++        self.assertEqual(status, 2)
++        self.assertIn("discard any partial output", err)
++
++    def test_cli_missing_file(self):
++        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
++            self.assertEqual(decoder.main([str(Path(directory) / "missing")]), 2)
++
++    def test_cli_partial_output_failure_is_explicit(self):
++        status, out, err = self.run_cli(HEADER + record(command(0xFC15, b"\x00\x00\x01")) + b"x")
++        self.assertEqual(status, 2)
++        self.assertIn('"opcode"', out)
++        self.assertIn("discard any partial output", err)
++
++
++if __name__ == "__main__":
++    unittest.main()
